@@ -3,52 +3,124 @@ extern crate ini;
 
 use ansi_term::Color::*;
 use libc::{sigfillset, sigprocmask, sigset_t, SIG_BLOCK};
+use nng::*;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
 use std::env;
+use std::fs::read_dir;
 use std::mem;
-use std::process::exit;
 use std::path::Path;
+use std::process::exit;
 use std::process::Command;
+use std::sync::Mutex;
+use std::thread;
+use std::thread::JoinHandle;
 
 static VERSION: &str = "0.1";
+static MONITORS: Lazy<Mutex<HashMap<String, JoinHandle<()>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 #[cfg(not(feature = "airupdbg"))]
 static AIRUP_CFG: &str = "/etc/airup.conf";
 #[cfg(feature = "airupdbg")]
 static AIRUP_CFG: &str = "./test/airup.conf";
-fn get_target_dir(ad:&str, name:&str) -> String {
+fn get_target_dir(ad: &str, name: &str) -> String {
     let mut rslt = ad.to_string();
-	if !ad.ends_with("/") {
-		rslt.push('/');
-	}
-	rslt.push_str(name);
-	rslt.push('/');
-	rslt
+    if !ad.ends_with("/") {
+        rslt.push('/');
+    }
+    rslt.push_str(name);
+    rslt.push('/');
+    rslt
 }
-fn target_exec(td:&str) {
-	let dir = td.to_string();
-	println!("{}Switching target to {}...", Blue.paint(" * "), Green.paint(td.clone()));
-	if !Path::new(td.clone()).exists() {
-		println!("{}Failed to switch target to {}: file does not exist!", Red.paint(" * "), Green.paint(td.clone()));
+fn open_airupctl_server() {
+    println!(
+        "{}Creating Airup Controlling Handling Server(NNG Rep)...",
+        Green.paint(" * ")
+    );
+    let addr = "ipc://airupd".to_string();
+    let server = Socket::new(Protocol::Rep0);
+    server.listen(&addr[..]);
+}
+fn target_exec(td: &str) {
+    let dir = td.to_string();
+    println!(
+        "{}Switching target to {}...",
+        Blue.paint(" * "),
+        Green.paint(td.clone())
+    );
+    if !Path::new(td.clone()).exists() {
+        println!(
+            "{}Failed to switch target to {}: file does not exist!",
+            Red.paint(" * "),
+            Green.paint(td.clone())
+        );
         return;
-	}
+    }
     let mut f = dir.clone();
     f.push_str("target.conf");
     let z = &f;
     let i = ini!(safe z);
     let i = match i {
-    	Ok(a) => a,
-    	Err(b) => {
-    		println!("{}Target main configuration parse error(path: {})", Red.paint(" * "), f);
-    		eprintln!("{}{}", Red.paint(" * "), b);
-    		return;
-    	},
+        Ok(a) => a,
+        Err(b) => {
+            println!(
+                "{}Target main configuration parse error(path: {})",
+                Red.paint(" * "),
+                f
+            );
+            eprintln!("{}{}", Red.paint(" * "), b);
+            return;
+        }
     };
     let name = tget(&i, "name");
     match name {
-    	Some(a) => println!("{}Switched target to {}!", Green.paint(" * "), Green.paint(a)),
-    	None => println!("{}Switched target to {}!", Green.paint(" * "), Green.paint(&dir)),
+        Some(a) => println!(
+            "{}Switched target to {}!",
+            Green.paint(" * "),
+            Green.paint(a)
+        ),
+        None => println!(
+            "{}Switched target to {}!",
+            Green.paint(" * "),
+            Green.paint(&dir)
+        ),
     };
+    let dependencies = tget(&i, "deps");
+    let dependencies = match dependencies {
+        Some(a) => a,
+        None => String::new(),
+    };
+    if dependencies != String::new() {
+        let dependencies: Vec<&str> = dependencies.split(' ').collect();
+        for i in dependencies.iter() {
+            let mut t = dir.clone();
+            t.push_str("../");
+            target_exec(&get_target_dir(&t[..], i));
+        }
+    }
+    let files = read_dir(&dir).unwrap();
+    let mut fls: Vec<String> = Vec::new();
+    for e in files {
+        let d = e.unwrap();
+        fls.push(d.file_name().to_str().unwrap().to_string());
+    }
+    for svc in fls.iter() {
+        if !svc.ends_with(".svc") {
+            continue;
+        }
+        let mut s = dir.clone();
+        s.push_str(&svc);
+        let s = &s[..];
+        let _ini = ini!(s);
+        let nn = svc.replace(".svc", &String::new()[..]);
+        (*MONITORS.lock().unwrap()).insert(
+            nn,
+            thread::spawn(move || {
+                sexec_monitor(&_ini);
+            }),
+        );
+    }
 }
 fn resolve_args(argv: &Vec<String>) -> String {
     let mut c: String = String::from("default");
@@ -81,15 +153,28 @@ fn print_svc_prompt(name: &str, desc: &str) {
         Blue.paint(desc)
     );
 }
-fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>) {}
+fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>) {
+    match sget(s, "name") {
+        Some(name) => {
+            let desc = match sget(s, "desc") {
+                Some(d) => d,
+                None => "".to_string(),
+            };
+            print_svc_prompt(&name, &desc);
+        }
+        None => {
+            print_svc_prompt("service", "");
+        }
+    };
+}
 fn tget(s: &HashMap<String, HashMap<String, Option<String>>>, c: &str) -> Option<String> {
-	if s.get("target") == None {
-		return None;
-	}
-	match &s["target"].get(c.clone()).clone() {
-		Some(a) => Some(a.as_ref().unwrap().to_string()),
-		None => None,
-	}
+    if s.get("target") == None {
+        return None;
+    }
+    match &s["target"].get(c.clone()).clone() {
+        Some(a) => Some(a.as_ref().unwrap().to_string()),
+        None => None,
+    }
 }
 fn sget(s: &HashMap<String, HashMap<String, Option<String>>>, c: &str) -> Option<String> {
     if s.get("svc") == None {
