@@ -1,3 +1,4 @@
 [svc]
 name = a
 desc = debug
+exec = ls

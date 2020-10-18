@@ -2,7 +2,7 @@
 extern crate ini;
 
 use ansi_term::Color::*;
-use libc::{sigfillset, sigprocmask, sigset_t, SIG_BLOCK};
+use libc::{sigfillset, sigprocmask, sigset_t, SIG_BLOCK, pid_t};
 use nng::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -13,6 +13,7 @@ use std::mem;
 use std::path::Path;
 use std::process::exit;
 use std::process::Command;
+use std::process::Child;
 use std::sync::Mutex;
 use std::thread;
 use std::thread::JoinHandle;
@@ -40,7 +41,26 @@ fn open_airupctl_server() {
     );
     let addr = "ipc://airupd".to_string();
     let server = Socket::new(Protocol::Rep0);
-    server.listen(&addr[..]);
+    let server = match server {
+    	Ok(a) => a,
+    	Err(b) => {
+    	    eprintln!("{}{}", Red.paint(" * "), b);
+    		println!("{}Airup Controlling Handling Server creating failed: recreating...", Red.paint(" * "));
+    		open_airupctl_server();
+    		return;
+    	},
+    };
+    let t = server.listen(&addr[..]);
+    match t {
+    	Ok(_a) => (),
+    	Err(b) => {
+    		eprintln!("{}{}", Red.paint(" * "), b);
+    		println!("{}Airup Controlling Handling Server creating failed: recreating...", Red.paint(" * "));
+    		open_airupctl_server();
+    		return;
+    	},
+    };
+    loop {}
 }
 fn target_exec(td: &str) {
     let dir = td.to_string();
@@ -153,7 +173,25 @@ fn print_svc_prompt(name: &str, desc: &str) {
         Blue.paint(desc)
     );
 }
+fn rsystem(s: &str) -> Option<Child> {
+	let handler = Command::new("/bin/sh")
+	.arg("-c")
+	.arg(s)
+	.spawn();
+	match handler {
+		Ok(a) => Some(a),
+		Err(_b) => None,
+	}
+}
 fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>) {
+    let cmd = match sget(s, "exec") {
+    	Some(a) => a,
+    	None => {
+    	    println!("{}Service 'exec' not found!", Red.paint(" * "));
+    	    return; 
+    	},
+    };
+    let rslt = rsystem(&cmd[..]);
     match sget(s, "name") {
         Some(name) => {
             let desc = match sget(s, "desc") {
@@ -260,4 +298,5 @@ fn main() {
     let argv: Vec<String> = env::args().collect();
     let target = resolve_args(&argv);
     target_exec(&get_target_dir(&airup_dir, &target));
+	open_airupctl_server();
 }
