@@ -1,4 +1,5 @@
 [svc]
 name = a
 desc = debug
-exec = ls
+exec = echo It works!
+deps = c d

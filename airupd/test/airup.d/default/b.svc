@@ -1,0 +1,4 @@
+[svc]
+name = b
+desc = debug2
+exec = echo B Done.

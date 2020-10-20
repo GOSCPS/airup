@@ -1,0 +1,4 @@
+[svc]
+name = d
+desc = debug dependecy
+exec = echo Dependencies works!
