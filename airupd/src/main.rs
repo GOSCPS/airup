@@ -1,6 +1,8 @@
+#![allow(unused)]
+
 use ansi_term::Color::*;
 use ini::ini;
-use libc::{sigfillset, sigprocmask, sigset_t, SIG_BLOCK};
+use libc::{kill, sigfillset, sigprocmask, sigset_t, SIG_BLOCK};
 use nng::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -19,8 +21,6 @@ use std::thread::JoinHandle;
 use std::time;
 
 static VERSION: &str = "0.1";
-static MONITORS: Lazy<Mutex<HashMap<String, JoinHandle<()>>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
 static SVCMSGS: Lazy<Mutex<HashMap<String, SvcMsg>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static AIRUP_DIR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
@@ -34,16 +34,17 @@ enum SvcMsg {
     Restart,
     Stop,
     Running,
+    MonitorExit,
 }
 fn svc_running(n: &str) -> bool {
-    let lk = &*SVCMSGS.lock().unwrap();
+    let lk = &mut *SVCMSGS.lock().unwrap();
     let t = match lk.get(n) {
         Some(_a) => true,
         None => false,
     };
     if t == true {
         match lk.get(n).unwrap() {
-            SvcMsg::Stop => (*SVCMSGS.lock().unwrap()).insert(n.to_string(), SvcMsg::Running),
+            SvcMsg::Stop => lk.insert(n.to_string(), SvcMsg::Running),
             _ => None,
         };
     }
@@ -174,12 +175,9 @@ fn sexec(dir: &str, svc: &str) {
         return;
     }
     (*SVCMSGS.lock().unwrap()).insert(nn.clone(), SvcMsg::Running);
-    (*MONITORS.lock().unwrap()).insert(
-        nn.clone(),
-        thread::spawn(move || {
-            sexec_monitor(&_ini, &nn);
-        }),
-    );
+    thread::spawn(move || {
+        sexec_monitor(&_ini, &nn);
+    });
 }
 fn resolve_args(argv: &Vec<String>) -> String {
     let mut c: String = String::from("default");
@@ -239,6 +237,31 @@ fn rsystem(s: &str) -> Option<Child> {
         Err(_b) => None,
     }
 }
+fn stopchild(c: &Child) {}
+fn child_running(c: &mut Child, n: &str) -> bool {
+    if c.try_wait().is_err() {
+        return true;
+    } else {
+        if c.try_wait().unwrap().is_none() {
+            return false;
+        } else {
+            if !c.try_wait().unwrap().unwrap().success() {
+                println!(
+                    "{}Service {} executing failed!!!",
+                    Red.paint(" * "),
+                    Red.paint(n.clone())
+                );
+            } else {
+                println!(
+                    "{}Service {} didn't report an error, but exited.",
+                    Yellow.paint(" * "),
+                    Yellow.paint(n.clone())
+                );
+            }
+            return false;
+        }
+    }
+}
 fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str) {
     let deps = match sget(s, "deps") {
         Some(a) => a,
@@ -264,6 +287,17 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
         }
     };
     let child = rsystem(&cmd[..]);
+    let mut child = child.unwrap();
+    match sget(s, "capture") {
+        Some(ra) => {
+            if ra != "false" {
+                child.stdout.take();
+            }
+        }
+        None => {
+            child.stdout.take();
+        }
+    }
     match sget(s, "name") {
         Some(name) => {
             let desc = match sget(s, "desc") {
@@ -276,6 +310,39 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
             print_svc_prompt("service", "");
         }
     };
+    let mut rt = 0;
+    let rtmax = 3;
+    let mut optiu = false;
+    loop {
+        let lk = &*SVCMSGS.lock().unwrap();
+        let lk = lk.get(&id.clone().to_string()).unwrap();
+        match lk {
+            SvcMsg::Stop => {}
+            SvcMsg::Restart => {}
+            SvcMsg::MonitorExit => {
+                return;
+            }
+            SvcMsg::Running => {
+                if rt == rtmax {
+                    if !*&optiu {
+                        println!(
+                            "{}Service {} restarted too many times!",
+                            Red.paint(" * "),
+                            Red.paint(id.clone())
+                        );
+                        *&mut optiu = true;
+                    }
+                } else {
+                    let mut cld = &mut child;
+                    if !child_running(cld, id.clone()) {
+                        let tt = rsystem(&cmd[..]);
+                        *cld = tt.unwrap();
+                        *&mut rt += 1;
+                    }
+                }
+            }
+        };
+    }
 }
 fn tget(s: &HashMap<String, HashMap<String, Option<String>>>, c: &str) -> Option<String> {
     if s.get("target") == None {

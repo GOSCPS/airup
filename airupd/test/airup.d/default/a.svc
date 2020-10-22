@@ -3,3 +3,4 @@ name = a
 desc = debug
 exec = echo It works!
 deps = c d
+capture = false
