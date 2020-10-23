@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use ansi_term::Color::*;
 use ini::ini;
 use libc::{kill, sigfillset, sigprocmask, sigset_t, SIG_BLOCK};
@@ -16,9 +14,8 @@ use std::process::Child;
 use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
-use std::thread::sleep;
-use std::thread::JoinHandle;
-use std::time;
+use std::cmp::PartialEq;
+use std::result::Result;
 
 static VERSION: &str = "0.1";
 static SVCMSGS: Lazy<Mutex<HashMap<String, SvcMsg>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -30,10 +27,12 @@ static AIRUP_CFG: &str = "/etc/airup.conf";
 #[cfg(feature = "airupdbg")]
 static AIRUP_CFG: &str = "./test/airup.conf";
 
+#[derive(PartialEq)]
 enum SvcMsg {
     Restart,
     Stop,
     Running,
+    Readying,
     MonitorExit,
 }
 fn svc_running(n: &str) -> bool {
@@ -45,6 +44,11 @@ fn svc_running(n: &str) -> bool {
     if t == true {
         match lk.get(n).unwrap() {
             SvcMsg::Stop => lk.insert(n.to_string(), SvcMsg::Running),
+            SvcMsg::Readying => loop {
+            	if (*SVCMSGS.lock().unwrap()).get(n).unwrap() == &SvcMsg::Running {
+            		break None;
+            	}
+            },
             _ => None,
         };
     }
@@ -58,6 +62,51 @@ fn get_target_dir(ad: &str, name: &str) -> String {
     rslt.push_str(name);
     rslt.push('/');
     rslt
+}
+fn msghandler(msg: &str) -> Result<String, ()> {
+    if msg.starts_with("service") {
+        let msg = msg;
+        let msg: Vec<&str> = msg.split(" ").collect();
+        let action = *msg.get(1).unwrap_or(&"");
+        let svc = *msg.get(2).unwrap_or(&"");
+        if action == "" || svc == "" {
+            Err(())
+        } else {
+            let a:SvcMsg;
+        	if action == "start" {
+        		a = SvcMsg::Running;
+        	} else if action == "stop" {
+        		a = SvcMsg::Stop;
+        	} else if action == "restart" {
+        		a = SvcMsg::Restart;
+        	} else if action == "status" {
+        	    let lk = &*SVCMSGS.lock().unwrap();
+        	    if lk.get(svc.clone()).is_none() {
+        	    	return Ok("SvcNotExist".to_string());
+        	    } else {
+        	    	let st = lk.get(svc).unwrap();
+        	    	let st = match st {
+        	    		SvcMsg::Running => "Running",
+        	    		SvcMsg::Stop => "Stop",
+        	    		_ => "Working",
+        	    	};
+        	    	return Ok(st.to_string());
+        	    }
+        	} else {
+        		return Err(());
+        	}
+        	let lk = &mut *SVCMSGS.lock().unwrap();
+        	if lk.get(svc.clone()).is_none() && a != SvcMsg::Running {
+        		return Ok(String::from("SvcNotExist"));
+        	}
+        	lk.insert(svc.to_string(), a);
+        	return Ok(String::from("Ok"));
+        }
+    } else if msg.starts_with("target") {
+        Err(())
+    } else {
+    	Err(())
+    }
 }
 fn open_airupctl_server() {
     println!(
@@ -93,6 +142,17 @@ fn open_airupctl_server() {
     };
     loop {
         let msg = server.recv();
+        if msg.is_ok() {
+            let msg = msg.unwrap();
+            let msg_str = msg.as_slice();
+            let msg_str = String::from_utf8_lossy(msg_str);
+            let msg_str = msghandler(&msg_str[..]);
+            let msg = match msg_str {
+            	Ok(a) => a,
+            	Err(()) => "Failed".to_string(),
+            };
+            let _rslt = server.send(msg.as_bytes()).is_ok();
+        }
     }
 }
 fn target_exec(td: &str) {
@@ -174,7 +234,7 @@ fn sexec(dir: &str, svc: &str) {
     if svc_running(&nn) {
         return;
     }
-    (*SVCMSGS.lock().unwrap()).insert(nn.clone(), SvcMsg::Running);
+    (*SVCMSGS.lock().unwrap()).insert(nn.clone(), SvcMsg::Readying);
     thread::spawn(move || {
         sexec_monitor(&_ini, &nn);
     });
@@ -237,7 +297,7 @@ fn rsystem(s: &str) -> Option<Child> {
         Err(_b) => None,
     }
 }
-fn stopchild(c: &Child) {}
+fn stopchild(c: &mut Child) {}
 fn child_running(c: &mut Child, n: &str) -> bool {
     if c.try_wait().is_err() {
         return true;
@@ -307,18 +367,37 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
             print_svc_prompt(&name, &desc);
         }
         None => {
-            print_svc_prompt("service", "");
+            print_svc_prompt(id.clone(), &sget(s, "desc").unwrap_or("comes without description".to_string()));
         }
     };
+    (*SVCMSGS.lock().unwrap()).insert(id.clone().to_string(), SvcMsg::Running);
     let mut rt = 0;
-    let rtmax = 3;
+    let rtmax = sget(s, "retry").unwrap_or("3".to_string()).parse::<isize>().unwrap_or(3);
     let mut optiu = false;
+    let howtostop = sget(s, "stop_handler").unwrap_or("default".to_string());
+    let howtorestart = sget(s, "restart_handler").unwrap_or("default".to_string());
     loop {
         let lk = &*SVCMSGS.lock().unwrap();
         let lk = lk.get(&id.clone().to_string()).unwrap();
         match lk {
-            SvcMsg::Stop => {}
-            SvcMsg::Restart => {}
+            SvcMsg::Stop => {
+            	if howtostop != "default" {
+            		rsystem(&howtostop[..]);
+            	} else {
+            		stopchild(&mut child);
+            	}
+            }
+            SvcMsg::Restart =>{
+                if howtostop != "default" {
+                    rsystem(&howtorestart[..]);
+                    rsystem(&howtostop[..]);
+                } else {
+                    stopchild(&mut child);
+                }
+                *&mut optiu = false;
+                *&mut rt = 0;
+                (*SVCMSGS.lock().unwrap()).insert(id.clone().to_string(), SvcMsg::Running);
+            }
             SvcMsg::MonitorExit => {
                 return;
             }
@@ -333,7 +412,7 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
                         *&mut optiu = true;
                     }
                 } else {
-                    let mut cld = &mut child;
+                    let cld = &mut child;
                     if !child_running(cld, id.clone()) {
                         let tt = rsystem(&cmd[..]);
                         *cld = tt.unwrap();
@@ -341,6 +420,7 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
                     }
                 }
             }
+            _ => ()
         };
     }
 }
