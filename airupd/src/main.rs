@@ -17,7 +17,7 @@ use std::thread;
 use std::cmp::PartialEq;
 use std::result::Result;
 
-static VERSION: &str = "0.1";
+static VERSION: &str = "0.3";
 static SVCMSGS: Lazy<Mutex<HashMap<String, SvcMsg>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static AIRUP_DIR: Lazy<Mutex<String>> = Lazy::new(|| Mutex::new(String::new()));
 
@@ -45,7 +45,7 @@ fn svc_running(n: &str) -> bool {
         match lk.get(n).unwrap() {
             SvcMsg::Stop => lk.insert(n.to_string(), SvcMsg::Running),
             SvcMsg::Readying => loop {
-            	if (*SVCMSGS.lock().unwrap()).get(n).unwrap() == &SvcMsg::Running {
+            	if *(*SVCMSGS.lock().unwrap()).get(n).unwrap() == SvcMsg::Running {
             		break None;
             	}
             },
