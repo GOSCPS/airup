@@ -1,6 +1,6 @@
 use ansi_term::Color::*;
 use ini::ini;
-use libc::{kill, sigfillset, sigprocmask, sigset_t, SIG_BLOCK};
+use libc::{kill, sigfillset, sigprocmask, sigset_t, SIG_BLOCK, pid_t, SIGTERM};
 use nng::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -113,7 +113,7 @@ fn open_airupctl_server() {
         "{}Creating Airup Controlling Handling Server(NNG Rep)...",
         Green.paint(" * ")
     );
-    let addr = "ipc://airupd".to_string();
+    let addr = "tcp://localhost:11257".to_string();
     let server = Socket::new(Protocol::Rep0);
     let server = match server {
         Ok(a) => a,
@@ -297,7 +297,18 @@ fn rsystem(s: &str) -> Option<Child> {
         Err(_b) => None,
     }
 }
-fn stopchild(c: &mut Child) {}
+fn stopchild(c: &mut Child) {
+    unsafe {
+	    kill(c.id() as pid_t, SIGTERM);
+    }
+	std::thread::sleep(std::time::Duration::from_millis(5000));
+	if c.try_wait().is_err() {
+		let z = c.kill();
+        if z.is_err() {
+            eprintln!("{}Failed to send SIGKILL to process!", Red.paint(" * "));
+        }
+	}
+}
 fn child_running(c: &mut Child, n: &str) -> bool {
     if c.try_wait().is_err() {
         return true;
@@ -376,18 +387,24 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
     let mut optiu = false;
     let howtostop = sget(s, "stop_handler").unwrap_or("default".to_string());
     let howtorestart = sget(s, "restart_handler").unwrap_or("default".to_string());
+    let mut stopped = false;
     loop {
         let lk = &*SVCMSGS.lock().unwrap();
         let lk = lk.get(&id.clone().to_string()).unwrap();
         match lk {
             SvcMsg::Stop => {
+                if stopped == true {
+                	continue;
+                }
             	if howtostop != "default" {
             		rsystem(&howtostop[..]);
             	} else {
             		stopchild(&mut child);
             	}
+            	stopped = true;
             }
             SvcMsg::Restart =>{
+                stopped = false;
                 if howtostop != "default" {
                     rsystem(&howtorestart[..]);
                     rsystem(&howtostop[..]);
@@ -402,6 +419,7 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
                 return;
             }
             SvcMsg::Running => {
+                stopped = false;
                 if rt == rtmax {
                     if !*&optiu {
                         println!(
