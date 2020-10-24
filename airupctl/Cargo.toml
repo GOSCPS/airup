@@ -8,3 +8,5 @@ edition = "2018"
 
 [dependencies]
 nng = "1.0.0-rc.2"
+ansi_term = "*"
+clap = "*"

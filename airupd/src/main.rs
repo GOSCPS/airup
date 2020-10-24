@@ -1,9 +1,10 @@
 use ansi_term::Color::*;
 use ini::ini;
-use libc::{kill, sigfillset, sigprocmask, sigset_t, SIG_BLOCK, pid_t, SIGTERM};
+use libc::{kill, pid_t, sigfillset, sigprocmask, sigset_t, SIGTERM, SIG_BLOCK};
 use nng::*;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::env;
 use std::fs::read_dir;
@@ -12,10 +13,9 @@ use std::path::Path;
 use std::process::exit;
 use std::process::Child;
 use std::process::Command;
+use std::result::Result;
 use std::sync::Mutex;
 use std::thread;
-use std::cmp::PartialEq;
-use std::result::Result;
 
 static VERSION: &str = "0.3";
 static SVCMSGS: Lazy<Mutex<HashMap<String, SvcMsg>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -45,9 +45,9 @@ fn svc_running(n: &str) -> bool {
         match lk.get(n).unwrap() {
             SvcMsg::Stop => lk.insert(n.to_string(), SvcMsg::Running),
             SvcMsg::Readying => loop {
-            	if *(*SVCMSGS.lock().unwrap()).get(n).unwrap() == SvcMsg::Running {
-            		break None;
-            	}
+                if *(*SVCMSGS.lock().unwrap()).get(n).unwrap() == SvcMsg::Running {
+                    break None;
+                }
             },
             _ => None,
         };
@@ -72,40 +72,49 @@ fn msghandler(msg: &str) -> Result<String, ()> {
         if action == "" || svc == "" {
             Err(())
         } else {
-            let a:SvcMsg;
-        	if action == "start" {
-        		a = SvcMsg::Running;
-        	} else if action == "stop" {
-        		a = SvcMsg::Stop;
-        	} else if action == "restart" {
-        		a = SvcMsg::Restart;
-        	} else if action == "status" {
-        	    let lk = &*SVCMSGS.lock().unwrap();
-        	    if lk.get(svc.clone()).is_none() {
-        	    	return Ok("SvcNotExist".to_string());
-        	    } else {
-        	    	let st = lk.get(svc).unwrap();
-        	    	let st = match st {
-        	    		SvcMsg::Running => "Running",
-        	    		SvcMsg::Stop => "Stop",
-        	    		_ => "Working",
-        	    	};
-        	    	return Ok(st.to_string());
-        	    }
-        	} else {
-        		return Err(());
-        	}
-        	let lk = &mut *SVCMSGS.lock().unwrap();
-        	if lk.get(svc.clone()).is_none() && a != SvcMsg::Running {
-        		return Ok(String::from("SvcNotExist"));
-        	}
-        	lk.insert(svc.to_string(), a);
-        	return Ok(String::from("Ok"));
+            let a: SvcMsg;
+            if action == "start" {
+                a = SvcMsg::Running;
+            } else if action == "stop" {
+                a = SvcMsg::Stop;
+            } else if action == "restart" {
+                a = SvcMsg::Restart;
+            } else if action == "status" {
+                let lk = &*SVCMSGS.lock().unwrap();
+                if lk.get(svc.clone()).is_none() {
+                    return Ok("SvcNotExist".to_string());
+                } else {
+                    let st = lk.get(svc).unwrap();
+                    let st = match st {
+                        SvcMsg::Running => "Running",
+                        SvcMsg::Stop => "Stop",
+                        _ => "Working",
+                    };
+                    return Ok(st.to_string());
+                }
+            } else {
+                return Err(());
+            }
+            let lk = &mut *SVCMSGS.lock().unwrap();
+            if lk.get(svc.clone()).is_none() && a != SvcMsg::Running {
+                return Ok(String::from("SvcNotExist"));
+            }
+            if a == SvcMsg::Running {
+                let mut tmp = String::from(svc);
+                tmp.push_str(".svc");
+                sexec(
+                    &get_target_dir(&*AIRUP_DIR.lock().unwrap(), "svc"),
+                    &tmp[..],
+                );
+                return Ok("Ok".to_string());
+            }
+            lk.insert(svc.to_string(), a);
+            return Ok(String::from("Ok"));
         }
     } else if msg.starts_with("target") {
         Err(())
     } else {
-    	Err(())
+        Err(())
     }
 }
 fn open_airupctl_server() {
@@ -148,8 +157,8 @@ fn open_airupctl_server() {
             let msg_str = String::from_utf8_lossy(msg_str);
             let msg_str = msghandler(&msg_str[..]);
             let msg = match msg_str {
-            	Ok(a) => a,
-            	Err(()) => "Failed".to_string(),
+                Ok(a) => a,
+                Err(()) => "Failed".to_string(),
             };
             let _rslt = server.send(msg.as_bytes()).is_ok();
         }
@@ -299,15 +308,15 @@ fn rsystem(s: &str) -> Option<Child> {
 }
 fn stopchild(c: &mut Child) {
     unsafe {
-	    kill(c.id() as pid_t, SIGTERM);
+        kill(c.id() as pid_t, SIGTERM);
     }
-	std::thread::sleep(std::time::Duration::from_millis(5000));
-	if c.try_wait().is_err() {
-		let z = c.kill();
+    std::thread::sleep(std::time::Duration::from_millis(5000));
+    if c.try_wait().is_err() {
+        let z = c.kill();
         if z.is_err() {
             eprintln!("{}Failed to send SIGKILL to process!", Red.paint(" * "));
         }
-	}
+    }
 }
 fn child_running(c: &mut Child, n: &str) -> bool {
     if c.try_wait().is_err() {
@@ -378,12 +387,18 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
             print_svc_prompt(&name, &desc);
         }
         None => {
-            print_svc_prompt(id.clone(), &sget(s, "desc").unwrap_or("comes without description".to_string()));
+            print_svc_prompt(
+                id.clone(),
+                &sget(s, "desc").unwrap_or("comes without description".to_string()),
+            );
         }
     };
     (*SVCMSGS.lock().unwrap()).insert(id.clone().to_string(), SvcMsg::Running);
     let mut rt = 0;
-    let rtmax = sget(s, "retry").unwrap_or("3".to_string()).parse::<isize>().unwrap_or(3);
+    let rtmax = sget(s, "retry")
+        .unwrap_or("3".to_string())
+        .parse::<isize>()
+        .unwrap_or(3);
     let mut optiu = false;
     let howtostop = sget(s, "stop_handler").unwrap_or("default".to_string());
     let howtorestart = sget(s, "restart_handler").unwrap_or("default".to_string());
@@ -394,16 +409,16 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
         match lk {
             SvcMsg::Stop => {
                 if stopped == true {
-                	continue;
+                    continue;
                 }
-            	if howtostop != "default" {
-            		rsystem(&howtostop[..]);
-            	} else {
-            		stopchild(&mut child);
-            	}
-            	stopped = true;
+                if howtostop != "default" {
+                    rsystem(&howtostop[..]);
+                } else {
+                    stopchild(&mut child);
+                }
+                stopped = true;
             }
-            SvcMsg::Restart =>{
+            SvcMsg::Restart => {
                 stopped = false;
                 if howtostop != "default" {
                     rsystem(&howtorestart[..]);
@@ -438,7 +453,7 @@ fn sexec_monitor(s: &HashMap<String, HashMap<String, Option<String>>>, id: &str)
                     }
                 }
             }
-            _ => ()
+            _ => (),
         };
     }
 }
