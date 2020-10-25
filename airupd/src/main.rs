@@ -95,8 +95,8 @@ fn msghandler(msg: &str) -> Result<String, ()> {
             } else {
                 return Err(());
             }
-            let lk = &mut *SVCMSGS.lock().unwrap();
-            if lk.get(svc.clone()).is_none() && a != SvcMsg::Running {
+            let llk = SVCMSGS.lock();
+            if (*llk.unwrap()).get(svc.clone()).is_none() && a != SvcMsg::Running {
                 return Ok(String::from("SvcNotExist"));
             }
             if a == SvcMsg::Running {
@@ -108,7 +108,7 @@ fn msghandler(msg: &str) -> Result<String, ()> {
                 );
                 return Ok("Ok".to_string());
             }
-            lk.insert(svc.to_string(), a);
+            (*llk.unwrap()).insert(svc.to_string(), a);
             return Ok(String::from("Ok"));
         }
     } else if msg.starts_with("target") {
@@ -244,7 +244,9 @@ fn sexec(dir: &str, svc: &str) {
         return;
     }
     (*SVCMSGS.lock().unwrap()).insert(nn.clone(), SvcMsg::Readying);
-    thread::spawn(move || {
+    let builder = thread::Builder::new()
+        .name(nn.clone().into());
+    builder.spawn(move || {
         sexec_monitor(&_ini, &nn);
     });
 }
@@ -505,6 +507,7 @@ fn main() {
             exit(-1);
         }
     }
+    #[cfg(not(feature = "airupdbg"))]
     unsafe {
         let mut s1: sigset_t = mem::zeroed();
         let mut s2: sigset_t = mem::zeroed();
