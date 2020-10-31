@@ -3,6 +3,16 @@
 use ansi_term::Color::*;
 use libc::{pid_t, getpid, sigprocmask, sigset_t, sigfillset, SIG_BLOCK};
 use std::process::exit;
+use std::fs;
+use toml::Value;
+
+static AIRUP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(feature = "airupdbg")]
+static AIRUP_CFG: &str = "test/airup.conf";
+
+#[cfg(not(feature = "airupdbg"))]
+static AIRUP_CFG: &str = "/etc/airup.conf";
 
 fn getpid_s() -> pid_t {
 	unsafe {
@@ -29,6 +39,25 @@ fn disable_signals() {
 	sigfillset_s(&mut sig1 as *mut sigset_t);
 	sigprocmask_s(SIG_BLOCK, &mut sig1 as *mut sigset_t, &mut sig2 as *mut sigset_t);
 }
+fn serious_err() -> ! {
+	loop {}
+}
+fn get_airup_configset() -> Value {
+    let cfgstr = fs::read_to_string(AIRUP_CFG);
+    match cfgstr {
+    	Ok(a) => {
+    		let x = a.parse::<Value>();
+    		if x.is_err() {
+    			serious_err();
+    		}
+    		return x.unwrap();
+    	},
+    	Err(b) => {
+    		eprintln!("{}{}", Red.paint(" * "), b);
+    		serious_err();
+    	},
+    };
+}
 #[tokio::main]
 async fn main() {
     #[cfg(not(feature = "airupdbg"))]
@@ -39,4 +68,5 @@ async fn main() {
     	}
     	disable_signals();
     }
+    let airup_cfgset = get_airup_configset();
 }
