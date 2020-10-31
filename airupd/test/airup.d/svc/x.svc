@@ -1,4 +1,0 @@
-[svc]
-name = x
-desc = start ipc debugger
-exec = echo AirupCtl Start works!

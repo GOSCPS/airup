@@ -1,7 +1,0 @@
-[svc]
-name = a
-desc = debug
-exec = echo It works!
-deps = c d
-capture = false
-stop_handler = echo hello world
