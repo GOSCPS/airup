@@ -4,6 +4,7 @@ use ansi_term::Color::*;
 use libc::{pid_t, getpid, sigprocmask, sigset_t, sigfillset, SIG_BLOCK};
 use std::process::exit;
 use std::fs;
+use std::process::Command;
 use toml::Value;
 
 static AIRUP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,6 +41,10 @@ fn disable_signals() {
 	sigprocmask_s(SIG_BLOCK, &mut sig1 as *mut sigset_t, &mut sig2 as *mut sigset_t);
 }
 fn serious_err() -> ! {
+    eprintln!("{}Airup Panicked and an emergency shell will be spawned.", Red.paint(" * "));
+    let _airup001 = Command::new("/bin/sh")
+        .spawn()
+        .is_ok();
 	loop {}
 }
 fn get_airup_configset() -> Value {
