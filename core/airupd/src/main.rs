@@ -3,9 +3,10 @@
 use ansi_term::Color::*;
 use libc::{pid_t, getpid, sigprocmask, sigset_t, sigfillset, SIG_BLOCK};
 use std::process::exit;
-use std::fs;
-use std::process::Command;
+use tokio::fs;
+use tokio::process::Command;
 use toml::Value;
+use std::collections::HashMap;
 
 static AIRUP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -40,15 +41,21 @@ fn disable_signals() {
 	sigfillset_s(&mut sig1 as *mut sigset_t);
 	sigprocmask_s(SIG_BLOCK, &mut sig1 as *mut sigset_t, &mut sig2 as *mut sigset_t);
 }
-fn serious_err() -> ! {
-    eprintln!("{}Airup Panicked and an emergency shell will be spawned.", Red.paint(" * "));
-    let _airup001 = Command::new("/bin/sh")
-        .spawn()
-        .is_ok();
+fn apanic() {
+	eprintln!("failed");
 	loop {}
 }
-fn get_airup_configset() -> Value {
-    let cfgstr = fs::read_to_string(AIRUP_CFG);
+async fn serious_err() {
+    eprintln!("{}Airup Panicked and an emergency shell will be spawned.", Red.paint(" * "));
+    let _t = Command::new("/bin/sh")
+        .spawn()
+        .is_err();
+    if _t {
+    	apanic();
+    }
+}
+async fn get_airup_configset() -> Value {
+    let cfgstr = fs::read_to_string(AIRUP_CFG).await;
     match cfgstr {
     	Ok(a) => {
     		let x = a.parse::<Value>();
@@ -59,9 +66,30 @@ fn get_airup_configset() -> Value {
     	},
     	Err(b) => {
     		eprintln!("{}{}", Red.paint(" * "), b);
-    		serious_err();
+    		serious_err().await;
+    		loop {}
     	},
     };
+}
+fn get_airupcfg_default(tname: &str) -> Value {
+	let mut matches: HashMap<String, Value> = HashMap::new();
+	matches.insert("airup_dir".to_string(), Value::String("/etc/airup.d".to_string()));
+	matches.insert("distro_name".to_string(), Value::String("Unknown OS".to_string()));
+	matches.insert("enable_logging".to_string(), Value::Boolean(true));
+	matches[tname].clone()
+}
+async fn sgac(cs: &Value, tname: &str) -> Value {
+	let cs = cs.clone();
+	let atable = cs.get("airup");
+	let atable = match atable {
+		Some(a) => a,
+		None => {
+			eprintln!("{}Failed to get Airup segment in config file.", Red.paint(" * "));
+			serious_err().await;
+			loop {}
+		},
+	};
+	atable.get(tname.clone()).unwrap_or(&get_airupcfg_default(tname)).clone()
 }
 #[tokio::main]
 async fn main() {
@@ -73,5 +101,6 @@ async fn main() {
     	}
     	disable_signals();
     }
-    let airup_cfgset = get_airup_configset();
+    let airup_cfgset = get_airup_configset().await;
+    println!("Airup {} is launching {}...", Blue.paint(AIRUP_VERSION), Blue.paint(sgac(&airup_cfgset, "distro_name").await.as_str().unwrap()));
 }
