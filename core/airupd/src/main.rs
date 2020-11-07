@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use ansi_term::Color::*;
 use libc::{pid_t, getpid, sigprocmask, sigset_t, sigfillset, SIG_BLOCK};
 use std::process::exit;
@@ -7,7 +5,25 @@ use tokio::fs;
 use tokio::process::Command;
 use toml::Value;
 use std::collections::HashMap;
+use nng::*;
+use std::path::PathBuf;
+use tokio::sync::Mutex;
+use once_cell::sync::Lazy;
+use std::result::Result;
+use std::thread;
 
+enum SvcOperate {
+	Start(String),
+	Restart(String),
+	Stop(String),
+	Status(String),
+}
+enum AirupMsg {
+	Svc(SvcOperate),
+	TargetExec(String),
+	Shutdown(String),
+}
+static RUNNING_SERVICES: Lazy<Mutex<Vec<String>>> = Lazy::new(|| Mutex::new(Vec::new()));
 static AIRUP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "airupdbg")]
@@ -16,6 +32,61 @@ static AIRUP_CFG: &str = "test/airup.conf";
 #[cfg(not(feature = "airupdbg"))]
 static AIRUP_CFG: &str = "/etc/airup.conf";
 
+async fn getmsg(msg: &str) -> Option<AirupMsg> {
+	let mut msg = msg.to_string();
+	let returning: AirupMsg;
+	if msg.starts_with("svc ") {
+	    let opr: SvcOperate;
+		msg.remove(0);
+		msg.remove(1);
+		msg.remove(2);
+		msg.remove(3);
+		if msg.starts_with("start ") {
+			msg.remove(0);
+			msg.remove(1);
+			msg.remove(2);
+			msg.remove(3);
+			msg.remove(4);
+			msg.remove(5);
+			opr = SvcOperate::Start(msg);
+		} else if msg.starts_with("stop ") {
+			msg.remove(0);
+			msg.remove(1);
+			msg.remove(2);
+			msg.remove(3);
+			msg.remove(4);
+			opr = SvcOperate::Stop(msg);
+		} else {
+			return None;
+		}
+		returning = AirupMsg::Svc(opr);
+	} else {
+		return None;
+	}
+	Some(returning)
+}
+fn ipc_loop() -> ! {
+    let address = "tcp://localhost:61257";
+    let server = Socket::new(Protocol::Rep0);
+    if server.is_err() {
+    	ipc_loop();
+    }
+    let server = server.unwrap();
+    let listen_stat = server.listen(address);
+    if listen_stat.is_err() {
+        drop(server);
+    	ipc_loop();
+    }
+    println!("{}Opening Airup's IPC Socket 61257...", Green.paint(" * "));
+	loop {
+		let msg = server.recv();
+	}
+}
+fn ipc_par() {
+	thread::spawn( || {
+		ipc_loop();
+	} );
+}
 fn getpid_s() -> pid_t {
 	unsafe {
 		getpid()
@@ -60,7 +131,7 @@ async fn get_airup_configset() -> Value {
     	Ok(a) => {
     		let x = a.parse::<Value>();
     		if x.is_err() {
-    			serious_err();
+    			serious_err().await;
     		}
     		return x.unwrap();
     	},
@@ -91,6 +162,29 @@ async fn sgac(cs: &Value, tname: &str) -> Value {
 	};
 	atable.get(tname.clone()).unwrap_or(&get_airupcfg_default(tname)).clone()
 }
+async fn supervisor_loop(dir: &str) -> Result<(), ()> {
+	let mut svctoml = PathBuf::from(dir);
+	svctoml.push("svc.toml");
+	if !svctoml.as_path().exists() {
+		return Err(());
+	}
+	let svctoml = fs::read_to_string(svctoml.to_str().unwrap()).await;
+	let svctoml = match svctoml {
+		Ok(a) => {
+			let x = a.parse::<Value>();
+			if x.is_err() {
+				return Err(());
+			} else {
+				x
+			}
+		},
+		Err(b) => {
+		    eprintln!("{}{}", Red.paint(" * "), b);
+			return Err(());
+		}
+	};
+	Ok(())
+}
 #[tokio::main]
 async fn main() {
     #[cfg(not(feature = "airupdbg"))]
@@ -103,4 +197,7 @@ async fn main() {
     }
     let airup_cfgset = get_airup_configset().await;
     println!("Airup {} is launching {}...", Blue.paint(AIRUP_VERSION), Blue.paint(sgac(&airup_cfgset, "distro_name").await.as_str().unwrap()));
+    ipc_par();
+	let airup_dir = sgac(&airup_cfgset, "airup_dir").await.as_str().unwrap().to_string();
+	let mut etdir = PathBuf::from(&airup_dir);
 }
