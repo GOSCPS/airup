@@ -13,8 +13,8 @@ airupdbg = []
 [dependencies]
 tokio = { version = "0.3.2", features = [ "rt", "rt-multi-thread", "io-std", "process", "macros", "sync", "fs", "time" ] }
 toml = "0.5.7"
-log4rs = "0.13.0"
 nng = "1.0.0-rc.2"
 ansi_term = "0.12.1"
 libc = "0.2.80"
-once_cell = "*"
+once_cell = "1.4.1"
+tracing = "0.1.21"

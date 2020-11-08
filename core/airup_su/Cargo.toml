@@ -1,5 +1,5 @@
 [package]
-name = "airupctl"
+name = "airup_su"
 version = "0.1.0"
 authors = ["sisungo <otelve@outlook.com>"]
 edition = "2018"
@@ -7,3 +7,7 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+clap = "2.33.3"
+libc = "0.2.80"
+nix = "0.19.0"
+users = "0.11.0"
