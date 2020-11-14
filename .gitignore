@@ -1,2 +1,2 @@
-core/*/target
-core/*/Cargo.lock
+*/target
+*/Cargo.lock
