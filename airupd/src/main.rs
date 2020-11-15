@@ -105,9 +105,13 @@ async fn stage_prestart_exec(dir: &str, paral: bool) {
     }
     let rd = rda;
     for i in rd.iter() {
-        let mut child = system(i.to_str().unwrap()).await.unwrap();
+        let child = system(&i.to_string_lossy()).await;
+        if child.is_none() {
+            continue;
+        }
+        let mut child = child.unwrap();
         if !paral {
-            child.wait();
+            let _ = child.wait();
         }
     }
 }
