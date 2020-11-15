@@ -1,5 +1,4 @@
 use ansi_term::Color::*;
-use async_std::{fs, prelude::*, println, sync::RwLock, task, io, path::{PathBuf, Path}};
 use libc::{getpid, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, SIG_BLOCK};
 use once_cell::sync::Lazy;
 use std::{
@@ -7,11 +6,13 @@ use std::{
     env,
     fmt::Display,
     fmt::Formatter,
-    mem, panic,
+    fs, io, mem, panic,
+    path::{Path, PathBuf},
     process::exit,
     process::{Child, Command},
+    sync::RwLock,
 };
-use toml::{Value, map::Map};
+use toml::{map::Map, Value};
 
 enum User {
     Id(uid_t),
@@ -41,10 +42,10 @@ enum SvcStatus {
     Unmentioned,
 }
 enum Stage {
-	PreStart,
-	Milestones(String),
-	Shutdown,
-	CtrlAltDel,
+    PreStart,
+    Milestones(String),
+    Shutdown,
+    CtrlAltDel,
 }
 
 static CURRENT_STAGE: Lazy<RwLock<Stage>> = Lazy::new(|| RwLock::new(Stage::PreStart));
@@ -73,21 +74,12 @@ static DEFAULT_CFG: Lazy<HashMap<String, Value>> = Lazy::new(|| {
         Value::String(default_prestart_dir),
     );
     a.insert(
-    	"milestone/description".to_string(),
-    	Value::String("An airup milestone".to_string())
+        "milestone/description".to_string(),
+        Value::String("An airup milestone".to_string()),
     );
-    a.insert(
-    	"milestone/paral".to_string(),
-    	Value::Boolean(true)
-    );
-    a.insert(
-    	"milestone/env_list".to_string(),
-    	Value::Table(Map::new())
-    );
-    a.insert(
-    	"milestone/dependencies".to_string(),
-    	Value::Array(vec![])
-    );
+    a.insert("milestone/paral".to_string(), Value::Boolean(true));
+    a.insert("milestone/env_list".to_string(), Value::Table(Map::new()));
+    a.insert("milestone/dependencies".to_string(), Value::Array(vec![]));
     a
 });
 
@@ -97,42 +89,46 @@ static AIRUP_CONF: &str = "/etc/airup.conf";
 #[cfg(feature = "quickdbg")]
 static AIRUP_CONF: &str = "debug/airup.conf";
 
-async fn stage_prestart_exec(dir: &str, paral: bool) {
-    if !Path::new(dir.clone()).exists().await {
+// Start Service Suoervisor
+fn svc_running_core(svc_name: &str) -> bool {}
+fn svc_running_block(svc_name: &str) -> bool {}
+fn regsvc(svc_name: &str, stat: SvcStatus) {}
+fn delsvc(svc_name: &str) {}
+fn svcrun(allsvc_dir: &str, svctomlpath: &str) -> bool {}
+fn svc_dep(allsvc_dir: &str, deps: Vec<String>) {}
+fn svc_supervisor_main(allsvcdir: &str, svctoml: Value) {}
+// End Service Supervisor
+fn stage_prestart_exec(dir: &str, paral: bool) {
+    if !Path::new(dir.clone()).exists() {
         println!(
             "{}The specified prestart stage directory {} does not exist. Aborting...",
             Red.paint(" * "),
             dir
-        )
-        .await;
+        );
         return;
     }
-    let rd = fs::read_dir(dir.clone()).await;
+    let rd = fs::read_dir(dir.clone());
     if rd.is_err() {
         println!(
             "{}The specified prestart stage directory {} is not a directory. Aborting...",
             Red.paint(" * "),
             dir
-        )
-        .await;
+        );
         return;
     }
     let rd = rd.unwrap();
-    let rd: Vec<io::Result<fs::DirEntry>> = rd.collect().await;
+    let rd: Vec<io::Result<fs::DirEntry>> = rd.collect();
     let mut rda: Vec<PathBuf> = Vec::new();
     for i in rd.iter() {
-    	if i.is_err() {
-    		continue;
-    	}
-    	rda.push(i.as_ref().unwrap().path());
+        if i.is_err() {
+            continue;
+        }
+        rda.push(i.as_ref().unwrap().path());
     }
     let rd = rda;
-    println!(
-    	"{}Running PreStart Objects...",
-    	Green.paint(" * ")
-    ).await;
+    println!("{}Running PreStart Objects...", Green.paint(" * "));
     for i in rd.iter() {
-        let child = system(&i.to_string_lossy()).await;
+        let child = system(&i.to_string_lossy());
         if child.is_none() {
             continue;
         }
@@ -142,20 +138,20 @@ async fn stage_prestart_exec(dir: &str, paral: bool) {
         }
     }
 }
-async fn system(cmd: &str) -> Option<Child> {
-        let a = Command::new("sh").arg("-c").arg(cmd).spawn();
-        match a {
-            Ok(b) => Some(b),
-            Err(_) => None,
-        }
+fn system(cmd: &str) -> Option<Child> {
+    let a = Command::new("sh").arg("-c").arg(cmd).spawn();
+    match a {
+        Ok(b) => Some(b),
+        Err(_) => None,
+    }
 }
-async fn asystem(user: &User, cmd: &str, env_list: &str) -> Option<Child> {
+fn asystem(user: &User, cmd: &str, env_list: &str) -> Option<Child> {
     let mut command = String::from(env_list);
     command.push_str(" exec ");
     command.push_str(cmd);
     #[cfg(feature = "no_airupsu")]
     {
-        system(&command).await
+        system(&command)
     }
     #[cfg(not(feature = "no_airupsu"))]
     {
@@ -178,8 +174,8 @@ async fn asystem(user: &User, cmd: &str, env_list: &str) -> Option<Child> {
         }
     }
 }
-async fn get_toml_of(path: &str) -> Option<Value> {
-    let fontext = fs::read_to_string(path).await;
+fn get_toml_of(path: &str) -> Option<Value> {
+    let fontext = fs::read_to_string(path);
     if fontext.is_err() {
         return None;
     }
@@ -254,19 +250,19 @@ fn g_airupconf(set: Option<Value>, vid: &str) -> Value {
     rslt
 }
 fn g_milestonetoml(set: Option<Value>, vid: &str) -> Option<Value> {
-	let temp = tomlget(set, "milestone", vid.clone());
-	let default = Lazy::new(|| get_default_value("milestone", vid));
-	if temp.is_none() && vid != "prompt" && vid != "pre_exec" {
-		return Some(default.as_ref().unwrap().clone());
-	}
-	let rslt = temp;
-	rslt
+    let temp = tomlget(set, "milestone", vid.clone());
+    let default = Lazy::new(|| get_default_value("milestone", vid));
+    if temp.is_none() && vid != "prompt" && vid != "pre_exec" {
+        return Some(default.as_ref().unwrap().clone());
+    }
+    let rslt = temp;
+    rslt
 }
-async fn pid_detect() {
+fn pid_detect() {
     #[cfg(not(feature = "quickdbg"))]
     {
         if getpid_s() != 1 {
-            println!("{}This program can only run as PID 1 as long as feature 'quickdbg' is not enabled.", Red.paint(" * ")).await;
+            println!("{}This program can only run as PID 1 as long as feature 'quickdbg' is not enabled.", Red.paint(" * "));
             exit(-1);
         }
         disable_signals();
@@ -299,103 +295,123 @@ fn set_airenv(ms: &str, ad: &str, par: bool) {
 }
 fn set_panic() {
     panic::set_hook(Box::new(|panic_info| {
-        std::println!("[!!!]Airup Panic");
-        std::eprintln!("Debug Data: {}", panic_info);
+        println!("[!!!]Airup Panic");
+        eprintln!("Error Message: {}", panic_info);
+        loop {}
     }));
 }
 // The following two functions are made for "dependencies" toml object resolving.
 fn str_to_vec(s: &str) -> Vec<String> {
-	vec![s.to_string()]
+    vec![s.to_string()]
 }
-async fn vv_to_vs(vv: Vec<Value>) -> Vec<String> {
+fn vv_to_vs(vv: Vec<Value>) -> Vec<String> {
     let mut vs = Vec::new();
-	for i in vv {
-		if !i.is_str() {
-			continue;
-		}
-		let i = i.as_str().unwrap();
-		vs.push(i.to_string());
-	}
-	vs
+    for i in vv {
+        if !i.is_str() {
+            continue;
+        }
+        let i = i.as_str().unwrap();
+        vs.push(i.to_string());
+    }
+    vs
 }
-async fn toml_env_setup(env_list: Map<String, Value>) {
-	let keys: Vec<&String> = env_list.keys().collect();
-	for key in keys {
-		let value = env_list.get(key).unwrap();
-		if !value.is_str() {
-			continue;
-		}
-		let value = value.as_str().unwrap();
-		env::set_var(key, value);
-	}
+fn toml_env_setup(env_list: Map<String, Value>) {
+    let keys: Vec<&String> = env_list.keys().collect();
+    for key in keys {
+        let value = env_list.get(key).unwrap();
+        if !value.is_str() {
+            continue;
+        }
+        let value = value.as_str().unwrap();
+        env::set_var(key, value);
+    }
 }
-async fn milestone_dep(mdir: &str, deps: Vec<String>) {
-	for i in deps.iter() {
-		let mut dir = PathBuf::from(mdir.clone());
-		dir.push(i);
-		milestone_exec(&dir.to_string_lossy()).await;
-	}
+fn milestone_dep(mdir: &str, deps: Vec<String>) {
+    for i in deps.iter() {
+        let mut dir = PathBuf::from(mdir.clone());
+        dir.push(i);
+        milestone_exec(&dir.to_string_lossy());
+    }
 }
-async fn milestone_exec(dir: &str) {
+fn milestone_exec(dir: &str) {
     // Judge if the milestone exists
-    if !Path::new(dir.clone()).exists().await {
-    	println!("{}The specified milestone {} does not exist.", Red.paint(" * "), Red.paint(dir.clone())).await;
-    	return;
+    if !Path::new(dir.clone()).exists() {
+        println!(
+            "{}The specified milestone {} does not exist.",
+            Red.paint(" * "),
+            Red.paint(dir.clone())
+        );
+        return;
     }
     // Find milestone.toml
     let mut mtpath = PathBuf::from(dir.clone());
     mtpath.push("milestone.toml");
     // Ready data
-	let milestone_toml = get_toml_of(&mtpath.to_string_lossy()).await;
-	let invalid = std::ffi::OsString::from("invalid");
-	let default_prompt = mtpath.file_name().unwrap_or(&invalid).to_string_lossy();
-	let prompt = g_milestonetoml(milestone_toml.clone(), "prompt").unwrap_or(Value::String(default_prompt.to_string()));
-	let prompt = prompt.as_str().unwrap();
-	let description = g_milestonetoml(milestone_toml.clone(), "description").unwrap();
-	let description = description.as_str().unwrap();
-	let paral = g_milestonetoml(milestone_toml.clone(), "paral").unwrap().as_bool().unwrap();
-	let env = g_milestonetoml(milestone_toml.clone(), "env_list").unwrap();
-	let env = env.as_table().unwrap();
-	// pre_exec may be Option::None.
-	let pre_exec = g_milestonetoml(milestone_toml.clone(), "pre_exec");
-	let dependencies = g_milestonetoml(milestone_toml, "dependencies").unwrap();
-	let dependencies = dependencies.as_array().unwrap();
-	let _files = fs::read_dir(dir.clone()).await;
-	if _files.is_err() {
-		println!("{}The specified milestone path {} is not a directory.", Red.paint(" * "), Red.paint(dir.clone())).await;
-		return;
-	}
-	let _files: Vec<io::Result<fs::DirEntry>> = _files.unwrap().collect().await;
-	let mut files: Vec<PathBuf> = Vec::new();
-	for i in _files.iter() {
-		files.push(i.as_ref().unwrap().path());
-	}
-	// Action
-	toml_env_setup(env.clone()).await;
-	println!("{}Reaching milestone {}({})...", Green.paint(" * "), Green.paint(prompt.clone()), Purple.paint(description)).await;
-    (*CURRENT_STAGE.write().await) = Stage::Milestones(prompt.to_string());
+    let milestone_toml = get_toml_of(&mtpath.to_string_lossy());
+    let invalid = std::ffi::OsString::from("invalid");
+    let default_prompt = mtpath.file_name().unwrap_or(&invalid).to_string_lossy();
+    let prompt = g_milestonetoml(milestone_toml.clone(), "prompt")
+        .unwrap_or(Value::String(default_prompt.to_string()));
+    let prompt = prompt.as_str().unwrap();
+    let description = g_milestonetoml(milestone_toml.clone(), "description").unwrap();
+    let description = description.as_str().unwrap();
+    let paral = g_milestonetoml(milestone_toml.clone(), "paral")
+        .unwrap()
+        .as_bool()
+        .unwrap();
+    let env = g_milestonetoml(milestone_toml.clone(), "env_list").unwrap();
+    let env = env.as_table().unwrap();
+    // pre_exec may be Option::None.
+    let pre_exec = g_milestonetoml(milestone_toml.clone(), "pre_exec");
+    let dependencies = g_milestonetoml(milestone_toml, "dependencies").unwrap();
+    let dependencies = dependencies.as_array().unwrap();
+    let _files = fs::read_dir(dir.clone());
+    if _files.is_err() {
+        println!(
+            "{}The specified milestone path {} is not a directory.",
+            Red.paint(" * "),
+            Red.paint(dir.clone())
+        );
+        return;
+    }
+    let _files: Vec<io::Result<fs::DirEntry>> = _files.unwrap().collect();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for i in _files.iter() {
+        files.push(i.as_ref().unwrap().path());
+    }
+    // Action
+    toml_env_setup(env.clone());
+    println!(
+        "{}Reaching milestone {}({})...",
+        Green.paint(" * "),
+        Green.paint(prompt.clone()),
+        Purple.paint(description)
+    );
+    (*CURRENT_STAGE.write().unwrap()) = Stage::Milestones(prompt.to_string());
     match pre_exec {
-    	Some(a) => {
-    		if !a.is_str() {
-    			()
-    		}
-    		let a = a.as_str().unwrap();
-    		system(a).await;
-    	},
-    	None => ()
+        Some(a) => {
+            if !a.is_str() {
+                ()
+            }
+            let a = a.as_str().unwrap();
+            system(a);
+        }
+        None => (),
     };
-    milestone_dep(&Path::new(dir.clone()).parent().unwrap().to_string_lossy(), vv_to_vs(dependencies.clone()).await).await;
+    milestone_dep(
+        &Path::new(dir.clone()).parent().unwrap().to_string_lossy(),
+        vv_to_vs(dependencies.clone()),
+    );
 }
-async fn stage_milestone_start(dir: &str, milestone: &str) {
-	let mut dir = PathBuf::from(dir);
-	dir.push(milestone);
-	milestone_exec(&dir.to_string_lossy()).await;
+fn stage_milestone_start(dir: &str, milestone: &str) {
+    let mut dir = PathBuf::from(dir);
+    dir.push(milestone);
+    milestone_exec(&dir.to_string_lossy());
 }
-#[async_std::main]
-async fn main() {
-    pid_detect().await;
+fn main() {
+    pid_detect();
     set_panic();
-    let airup_conf = get_toml_of(AIRUP_CONF).await;
+    let airup_conf = get_toml_of(AIRUP_CONF);
     //Prepare some values from airup.conf
     let osname = g_airupconf(airup_conf.clone(), "osname");
     let osname = osname.as_str().unwrap();
@@ -409,8 +425,7 @@ async fn main() {
         Purple.paint("Airup"),
         Purple.paint(AIRUP_VERSION.clone()),
         Green.paint(osname)
-    )
-    .await;
+    );
     let milestone = get_milestone();
     let airup_home = g_airupconf(airup_conf.clone(), "airup_home");
     let airup_home = airup_home.as_str().unwrap();
@@ -427,10 +442,9 @@ async fn main() {
                 .unwrap(),
         ),
         prestart_paral,
-    )
-    .await;
+    );
     let mut milestones_dir = PathBuf::from(airup_home.clone());
     milestones_dir.push("milestones");
     let milestones_dir = milestones_dir.to_string_lossy();
-    stage_milestone_start(&milestones_dir, &milestone).await;
+    stage_milestone_start(&milestones_dir, &milestone);
 }

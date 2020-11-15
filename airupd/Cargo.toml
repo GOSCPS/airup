@@ -13,10 +13,7 @@ no_airupsu = []
 
 [dependencies]
 ansi_term = "0.12.1"
-async-std = { version = "1.7.0", features = ["unstable", "attributes"] }
 libc = "0.2.80"
 nng = "0.5.1"
 once_cell = "1.4.1"
 toml = "0.5.7"
-futures-core = "0.3.8"
-futures-lite = "1.11.2"
