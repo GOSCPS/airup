@@ -4,4 +4,3 @@ description = "The default debug milestone"
 paral = true
 env_list = { abc = "It works!" }
 pre_exec = "echo $abc"
-dependencies = [ "default" ]
