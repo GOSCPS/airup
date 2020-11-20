@@ -535,7 +535,7 @@ fn stage_milestone_start(ad: &str, dir: &str, milestone: &str) {
 }
 fn enable_rw() {
     let address = "tcp://127.0.0.1:61257";
-    let server = Socket::new(Protocol::Rep0);
+    let server = Socket::new(Protocol::Pair1);
     let server = match server {
         Ok(a) => a,
         Err(b) => {
@@ -560,7 +560,55 @@ fn enable_rw() {
             return;
         }
     };
-    loop {}
+    let mut sups: HashMap<String, Socket> = HashMap::new();
+    let supls = Socket::new(Protocol::Pull0);
+    let supls = match supls {
+        Ok(a) => a,
+        Err(b) => {
+            eprintln!(
+                "{}Failed to create NNG Socket({}): running in RO mode!",
+                Red.paint(" * "),
+                b
+            );
+            return;
+        }
+    };
+    let c = supls.listen("inproc://airup/regsvc");
+    match c {
+        Ok(_) => (),
+        Err(a) => {
+            eprintln!(
+                "{}Failed to listen address {}({}): running in RO mode!",
+                Red.paint(" * "),
+                address,
+                a
+            );
+            return;
+        }
+    };
+    let base_dir = "inproc://airup/supervisors/";
+    loop {
+        // Find new supervisors
+        let msg = supls.try_recv();
+        if msg.is_ok() {
+            let msg = msg.unwrap();
+            let skt = Socket::new(Protocol::Pair1);
+            let skt = match skt {
+                Ok(a) => a,
+                Err(_) => { continue; }
+            };
+            let mut mdir = String::from(base_dir.clone());
+            mdir.push_str(&String::from_utf8_lossy(msg.as_slice()));
+            let c = skt.dial(&mdir);
+            match c {
+                Ok(_) => (),
+                Err(_) => { continue; }
+            };
+            sups.insert(mdir, skt);
+        }
+        // Detect IPC messages
+        let msg = server.try_recv();
+    }
 }
 fn main() {
     pid_detect();
@@ -597,9 +645,18 @@ fn main() {
         ),
         prestart_paral,
     );
+    let thrd = Builder::new().name("ipcmgr".to_string());
+    let rwmode = thrd.spawn(|| enable_rw()).unwrap();
     let mut milestones_dir = PathBuf::from(airup_home.clone());
     milestones_dir.push("milestones");
     let milestones_dir = milestones_dir.to_string_lossy();
     stage_milestone_start(airup_home.clone(), &milestones_dir, &milestone);
-    enable_rw();
+    let jh = rwmode.join();
+    if jh.is_err() {
+        println!(
+            "{}Failed to use high-performance mode: using loops!",
+            Red.paint(" * ")
+        );
+    }
+    loop {}
 }
