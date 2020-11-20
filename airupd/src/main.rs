@@ -51,6 +51,7 @@ enum Stage {
     CtrlAltDel,
 }
 
+static COMM_INIT: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 static CURRENT_STAGE: Lazy<RwLock<Stage>> = Lazy::new(|| RwLock::new(Stage::PreStart));
 static AIRUP_VERSION: &str = env!("CARGO_PKG_VERSION");
 static SVC_STATUS: Lazy<RwLock<HashMap<String, SvcStatus>>> =
@@ -116,8 +117,19 @@ fn svc_running_block(id: &str) -> bool {
     }
     false
 }
-fn regsvc(id: &str, stat: SvcStatus) {
+fn regsvc(id: &str, stat: SvcStatus) -> Socket {
     (*SVC_STATUS.write().unwrap()).insert(id.to_string(), stat);
+    let base_dir = "inproc://airup/supervisors/";
+    let mut dir = String::from(base_dir);
+    dir.push_str(id.clone());
+    let skt = Socket::new(Protocol::Pair1).unwrap();
+    skt.listen(&dir).unwrap();
+    let telr = Socket::new(Protocol::Push0).unwrap();
+    telr.dial("inproc://airup/regsvc").unwrap();
+    let mut msg = String::from("up ");
+    msg.push_str(id);
+    telr.send(msg.as_bytes()).unwrap();
+    skt
 }
 fn delsvc(id: &str) {
     (*SVC_STATUS.write().unwrap()).remove(id);
@@ -164,7 +176,7 @@ fn g_svc(set: Value, vid: &str) -> Option<Value> {
         return Some(default.as_ref().unwrap().clone());
     }
     if temp.is_none() && vid == "prompt" {
-    	return None;
+        return None;
     }
     let temp = temp.unwrap();
     Some(temp)
@@ -355,7 +367,7 @@ fn g_milestonetoml(set: Option<Value>, vid: &str) -> Option<Value> {
         return Some(default.as_ref().unwrap().clone());
     }
     if temp.is_none() && (vid == "prompt" || vid == "pre_exec") {
-    	return None;
+        return None;
     }
     let temp = temp.unwrap();
     if (!temp.is_str()) && (vid == "prompt" || vid == "description" || vid == "pre_exec") {
@@ -462,7 +474,12 @@ fn milestone_exec(ad: &str, dir: &str) {
     // Ready data
     let milestone_toml = get_toml_of(&mtpath.to_string_lossy());
     let invalid = std::ffi::OsString::from("invalid");
-    let default_prompt = mtpath.parent().unwrap().file_name().unwrap_or(&invalid).to_string_lossy();
+    let default_prompt = mtpath
+        .parent()
+        .unwrap()
+        .file_name()
+        .unwrap_or(&invalid)
+        .to_string_lossy();
     let prompt = g_milestonetoml(milestone_toml.clone(), "prompt")
         .unwrap_or(Value::String(default_prompt.to_string()));
     let prompt = prompt.as_str().unwrap();
@@ -587,6 +604,8 @@ fn enable_rw() {
         }
     };
     let base_dir = "inproc://airup/supervisors/";
+    (*COMM_INIT.write().unwrap()) = true;
+    println!("{}Starting communicating bridges", Green.paint(" * "));
     loop {
         // Find new supervisors
         let msg = supls.try_recv();
@@ -595,16 +614,30 @@ fn enable_rw() {
             let skt = Socket::new(Protocol::Pair1);
             let skt = match skt {
                 Ok(a) => a,
-                Err(_) => { continue; }
+                Err(_) => {
+                    continue;
+                }
             };
             let mut mdir = String::from(base_dir.clone());
-            mdir.push_str(&String::from_utf8_lossy(msg.as_slice()));
-            let c = skt.dial(&mdir);
-            match c {
-                Ok(_) => (),
-                Err(_) => { continue; }
-            };
-            sups.insert(mdir, skt);
+            let mut id = String::from_utf8_lossy(msg.as_slice()).to_string();
+            let mut is_up = true;
+            if id.starts_with("up ") {
+                id = id[3..].to_string();
+            } else if id.starts_with("down ") {
+                id = id[5..].to_string();
+                is_up = false;
+            }
+            if is_up {
+                mdir.push_str(&id);
+                let c = skt.dial(&mdir);
+                match c {
+                    Ok(_) => (),
+                    Err(_) => {
+                        continue;
+                    }
+                };
+                sups.insert(id, skt);
+            }
         }
         // Detect IPC messages
         let msg = server.try_recv();
@@ -647,6 +680,11 @@ fn main() {
     );
     let thrd = Builder::new().name("ipcmgr".to_string());
     let rwmode = thrd.spawn(|| enable_rw()).unwrap();
+    loop {
+        if (*COMM_INIT.read().unwrap()) == true {
+            break;
+        }
+    }
     let mut milestones_dir = PathBuf::from(airup_home.clone());
     milestones_dir.push("milestones");
     let milestones_dir = milestones_dir.to_string_lossy();
