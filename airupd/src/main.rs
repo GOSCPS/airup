@@ -1,16 +1,17 @@
 use ansi_term::Color::*;
-use libc::{getpid, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, SIG_BLOCK};
+use libc::{getpid, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, SIG_BLOCK, waitpid, WNOHANG, c_int};
 use nng::{Protocol, Socket};
 use once_cell::sync::Lazy;
 use std::{
     cmp::PartialEq,
     collections::HashMap,
+    convert::TryInto,
     env,
     fmt::Display,
     fmt::Formatter,
     fs, io, mem, panic,
     path::{Path, PathBuf},
-    process::{exit, Child, Command},
+    process::{exit, Command},
     sync::RwLock,
     thread::Builder,
 };
@@ -88,6 +89,13 @@ static DEFAULT_CFG: Lazy<HashMap<String, Value>> = Lazy::new(|| {
         "svc/description".to_string(),
         Value::String("An airup service".to_string()),
     );
+    a.insert("svc/env_list".to_string(), Value::Table(Map::new()));
+    a.insert("svc/take_io".to_string(), Value::Boolean(true));
+    a.insert("svc/dependencies".to_string(), Value::Array(Vec::new()));
+    a.insert("svc/stop_way".to_string(), Value::Integer(15));
+    a.insert("svc/cleanup_on_restart".to_string(), Value::Boolean(true));
+    a.insert("svc/retry_time".to_string(), Value::Integer(3));
+    a.insert("svc/kill_timeout".to_string(), Value::Integer(5000));
     a
 });
 
@@ -117,8 +125,10 @@ fn svc_running_block(id: &str) -> bool {
     }
     false
 }
-fn regsvc(id: &str, stat: SvcStatus) -> Socket {
+fn regsvc(id: &str, stat: SvcStatus) {
     (*SVC_STATUS.write().unwrap()).insert(id.to_string(), stat);
+}
+fn regmsg(id: &str) -> Socket {
     let base_dir = "inproc://airup/supervisors/";
     let mut dir = String::from(base_dir);
     dir.push_str(id.clone());
@@ -133,64 +143,184 @@ fn regsvc(id: &str, stat: SvcStatus) -> Socket {
 }
 fn delsvc(id: &str) {
     (*SVC_STATUS.write().unwrap()).remove(id);
+    let mut msg = String::from("down ");
+    msg.push_str(id);
+    let telr = Socket::new(Protocol::Push0).unwrap();
+    telr.dial("inproc://airup/regsvc").unwrap();
+    telr.send(msg.as_bytes()).unwrap();
 }
 fn svcrun(airup_dir: &'static str, svctomlpath: &'static str) -> bool {
     let svctoml = get_toml_of(svctomlpath);
+    let id = svcid_detect(svctomlpath.clone());
+    if svc_running_block(&id) {
+        return true;
+    }
     if svctoml.is_none() {
-        println!(
+        eprintln!(
             "{}Some problems happened when launching service {}.",
             Red.paint(" * "),
             svctomlpath
         );
         return false;
     }
-    let id = svcid_detect(svctomlpath.clone());
-    if svc_running_block(&id) {
-        return true;
-    }
-    let thrd = Builder::new().name(id.to_string());
     let svctoml = svctoml.unwrap();
+    let thrd = Builder::new().name(id.to_string());
     let thrd = thrd.spawn(move || svc_supervisor_main(&id, airup_dir, svctoml));
     if thrd.is_err() {
-        println!("{}OS Error: Failed to create thread!", Red.paint(" *** "));
+        eprintln!("{}OS Error: Failed to create thread!", Red.paint(" * "));
         return false;
     }
     true
 }
 fn svc_dep(airup_dir: &'static str, deps: Vec<String>) {
-    for i in deps {
-        let mut i = String::from(i);
+    for dep in deps {
+        let mut i = String::from(&dep);
         if i.starts_with("alias::") {
-            let e = PathBuf::from(airup_dir.clone());
-            unreachable!();
+            let mut e = PathBuf::from(airup_dir.clone());
+            let nh = i[7..].to_string();
+            e.push(&nh);
         } else {
+            let mut e = PathBuf::from(airup_dir.clone());
+            e.push("svc");
             i.push_str(".svc");
-            svcrun(airup_dir.clone(), Box::leak(i.into_boxed_str()));
+            e.push(&i);
+            svcrun(
+                airup_dir.clone(),
+                Box::leak(e.to_string_lossy().to_string().into_boxed_str()),
+            );
         }
+        svc_running_block(&dep);
     }
 }
 fn g_svc(set: Value, vid: &str) -> Option<Value> {
     let temp = tomlget(Some(set), "svc", vid.clone());
     let default = Lazy::new(|| get_default_value("svc", vid));
-    if temp.is_none() && vid != "prompt" {
+    if temp.is_none()
+        && (vid != "prompt"
+            && vid != "user"
+            && vid != "action_user"
+            && vid != "exec"
+            && vid != "pid_file"
+            && vid != "pre_exec"
+            && vid != "pre_stop"
+            && vid != "cleanup"
+            && vid != "pre_restart"
+            && vid != "ready_timeout"
+            && vid != "restart_way")
+    {
         return Some(default.as_ref().unwrap().clone());
     }
-    if temp.is_none() && vid == "prompt" {
+    if temp.is_none()
+        && (vid == "prompt"
+            || vid == "user"
+            || vid == "action_user"
+            || vid == "exec"
+            || vid == "pid_file"
+            || vid == "pre_exec"
+            || vid == "pre_stop"
+            || vid == "cleanup"
+            || vid == "pre_restart"
+            || vid == "ready_timeout"
+            || vid == "restart_way")
+    {
         return None;
     }
     let temp = temp.unwrap();
+    if (!temp.is_bool()) && (vid == "take_io") {
+        return Some(default.as_ref().unwrap().clone());
+    }
+    if (!temp.is_str()) && (vid == "description" || vid == "pre_exec" || vid == "exec") {
+        return Some(default.as_ref().unwrap().clone());
+    }
+    if (!temp.is_array()) && (vid == "dependencies") {
+        return Some(default.as_ref().unwrap().clone());
+    }
     Some(temp)
 }
-fn svc_supervisor_main(id: &str, airup_dir: &str, svctoml: Value) {
+fn envmaptostr(mp: &Map<String, Value>) -> String {
+    let keys: Vec<&String> = mp.keys().collect();
+    let mut r = String::new();
+    for key in keys.iter() {
+        let val = mp.get(key.clone()).unwrap();
+        if !val.is_str() {
+            continue;
+        }
+        let val = val.as_str().unwrap();
+        r.push_str(key);
+        r.push('=');
+        r.push('"');
+        r.push_str(val);
+        r.push('"');
+    }
+    r
+}
+fn get_user_by_value(val: Option<Value>) -> User {
+    if val.is_none() {
+        return User::Id(0);
+    }
+    let val = val.unwrap();
+    match val {
+        Value::Integer(a) => User::Id(a.try_into().unwrap()),
+        Value::String(b) => User::Name(b),
+        _ => User::Id(0),
+    }
+}
+fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     regsvc(id.clone(), SvcStatus::Readying);
-    let prompt = g_svc(svctoml.clone(), "prompt")
-        .unwrap_or(Value::String(id.to_string()))
-        .as_str()
-        .unwrap_or(id.clone());
+    let channel = regmsg(id.clone());
+    // Ready some basic values.
+    let prompt = g_svc(svctoml.clone(), "prompt").unwrap_or(Value::String(id.to_string()));
+    let prompt = prompt.as_str().unwrap_or(id.clone());
     let desc = g_svc(svctoml.clone(), "description")
         .unwrap()
         .as_str()
         .unwrap();
+    let env_map = g_svc(svctoml.clone(), "env_list").unwrap();
+    let env_map = env_map.as_table().unwrap();
+    let sh_env = envmaptostr(env_map);
+    let user = g_svc(svctoml.clone(), "user");
+    let action_user = g_svc(svctoml.clone(), "action_user");
+    let user = get_user_by_value(user);
+    let action_user = get_user_by_value(action_user);
+    let take_io = g_svc(svctoml.clone(), "take_io")
+        .unwrap()
+        .as_bool()
+        .unwrap();
+    let deps = g_svc(svctoml.clone(), "dependencies").unwrap();
+    let deps = deps.as_array().unwrap();
+    let deps = vv_to_vs(deps.to_vec());
+    svc_dep(airup_dir, deps);
+    // Ready for exec
+    let pre_exec = g_svc(svctoml.clone(), "pre_exec");
+    let exec = g_svc(svctoml.clone(), "exec");
+    let pid_file = g_svc(svctoml.clone(), "pid_file");
+    let exec = match exec {
+        Some(a) => a,
+        None => {
+            eprintln!(
+                "{}Failed to execute service {}: no 'exec' specified!",
+                Red.paint(" * "),
+                prompt
+            );
+            return;
+        }
+    };
+    // Ready for stop
+    let pre_stop = g_svc(svctoml.clone(), "pre_stop");
+    // stop_way: string to exec a command(or SIGNAL::xx to send signal), number to send signal
+    let stop_way = g_svc(svctoml.clone(), "stop_way").unwrap();
+    let cleanup = g_svc(svctoml.clone(), "cleanup");
+    // Ready for restart
+    let pre_restart = g_svc(svctoml.clone(), "pre_restart");
+    let restart_way = g_svc(svctoml.clone(), "restart_way").unwrap_or(stop_way.clone());
+    let cleanup_on_restart = g_svc(svctoml.clone(), "cleanup_on_restart").unwrap();
+    let cleanup_on_restart = cleanup_on_restart.as_bool().unwrap();
+    // exception handling data.
+    let retry_time = g_svc(svctoml.clone(), "retry_time").unwrap();
+    let retry_time = retry_time.as_integer().unwrap();
+    let ready_timeout = g_svc(svctoml.clone(), "ready_timeout");
+    let kill_timeout = g_svc(svctoml.clone(), "kill_timeout").unwrap();
+    let kill_timeout = kill_timeout.as_integer().unwrap();
 }
 fn svcid_detect(svctomlpath: &str) -> String {
     if fs::symlink_metadata(svctomlpath.clone())
@@ -209,6 +339,24 @@ fn svcid_detect(svctomlpath: &str) -> String {
     }
 }
 // End Service Supervisor
+fn try_wait(pid: pid_t) -> Option<c_int> {
+	unsafe {
+		let mut status: c_int = 0;
+		let wait_status = waitpid(pid, &mut status as *mut c_int, WNOHANG);
+		if wait_status == 0 {
+			return None;
+		} else {
+			return Some(status);
+		}
+	}
+}
+fn wait(pid: pid_t) -> c_int {
+    unsafe {
+    	let mut status: c_int = 0;
+    	waitpid(pid, &mut status as *mut c_int, 0);
+    	return status;
+    }
+}
 fn stage_prestart_exec(dir: &str, paral: bool) {
     if !Path::new(dir.clone()).exists() {
         println!(
@@ -243,20 +391,20 @@ fn stage_prestart_exec(dir: &str, paral: bool) {
         if child.is_none() {
             continue;
         }
-        let mut child = child.unwrap();
+        let child = child.unwrap();
         if !paral {
-            let _ = child.wait();
+            wait(child);
         }
     }
 }
-fn system(cmd: &str) -> Option<Child> {
+fn system(cmd: &str) -> Option<pid_t> {
     let a = Command::new("sh").arg("-c").arg(cmd).spawn();
     match a {
-        Ok(b) => Some(b),
+        Ok(b) => Some(b.id().try_into().unwrap()),
         Err(_) => None,
     }
 }
-fn asystem(user: &User, cmd: &str, env_list: &str) -> Option<Child> {
+fn asystem(user: &User, cmd: &str, env_list: &str) -> Option<pid_t> {
     let mut command = String::from(env_list);
     command.push_str(" exec ");
     command.push_str(cmd);
@@ -280,7 +428,7 @@ fn asystem(user: &User, cmd: &str, env_list: &str) -> Option<Child> {
             .arg(command)
             .spawn();
         match a {
-            Ok(b) => Some(b),
+            Ok(b) => Some(b.id().try_into().unwrap()),
             Err(_) => None,
         }
     }
@@ -605,19 +753,12 @@ fn enable_rw() {
     };
     let base_dir = "inproc://airup/supervisors/";
     (*COMM_INIT.write().unwrap()) = true;
-    println!("{}Starting communicating bridges", Green.paint(" * "));
+    println!("{}Starting communicating bridges...", Green.paint(" * "));
     loop {
         // Find new supervisors
         let msg = supls.try_recv();
         if msg.is_ok() {
             let msg = msg.unwrap();
-            let skt = Socket::new(Protocol::Pair1);
-            let skt = match skt {
-                Ok(a) => a,
-                Err(_) => {
-                    continue;
-                }
-            };
             let mut mdir = String::from(base_dir.clone());
             let mut id = String::from_utf8_lossy(msg.as_slice()).to_string();
             let mut is_up = true;
@@ -628,6 +769,13 @@ fn enable_rw() {
                 is_up = false;
             }
             if is_up {
+                let skt = Socket::new(Protocol::Pair1);
+                let skt = match skt {
+                    Ok(a) => a,
+                    Err(_) => {
+                        continue;
+                    }
+                };
                 mdir.push_str(&id);
                 let c = skt.dial(&mdir);
                 match c {
@@ -637,11 +785,24 @@ fn enable_rw() {
                     }
                 };
                 sups.insert(id, skt);
+            } else {
+                sups.get_mut(&id).unwrap().close();
+                sups.remove(&id);
             }
         }
         // Detect IPC messages
         let msg = server.try_recv();
+        if msg.is_ok() {
+            let msg = msg.unwrap();
+            let msg = String::from_utf8_lossy(msg.as_slice());
+            ipc_msghandler(&msg, &sups);
+        }
     }
+}
+fn ipc_msghandler(msg: &str, sups: &HashMap<String, Socket>) {
+	if msg.starts_with("svc ") {
+		let msg = &msg[4..];
+	}
 }
 fn main() {
     pid_detect();
@@ -692,7 +853,7 @@ fn main() {
     let jh = rwmode.join();
     if jh.is_err() {
         println!(
-            "{}Failed to use high-performance mode: using loops!",
+            "{}BUG: RW Mode daemon thread panicked: using loops!",
             Red.paint(" * ")
         );
     }
