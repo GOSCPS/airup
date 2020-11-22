@@ -1,2 +1,3 @@
 [svc]
 prompt = "b"
+exec = "echo Dependency-resolver works!"
