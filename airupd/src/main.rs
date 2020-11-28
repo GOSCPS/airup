@@ -1,5 +1,5 @@
 use ansi_term::Color::*;
-use libc::{getpid, kill, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, SIG_BLOCK, waitpid, WNOHANG, c_int};
+use libc::{getpid, kill, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, SIG_BLOCK, waitpid, WNOHANG, c_int, SIGKILL, SIGTERM};
 use nng::{Protocol, Socket};
 use once_cell::sync::Lazy;
 use std::{
@@ -320,7 +320,9 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     // ready functions
     let mut pid = 0;
     let id = String::from(id);
-    let full_stop = || {
+    let mut kill_timer: Option<Arc<RwLock<bool>>> = None;
+    let mut die_timer: Option<Arc<RwLock<bool>>> = None;
+    let mut full_stop = || {
     	let pre_stop = &pre_stop;
     	let stop_way = &stop_way;
         if pre_stop.is_some() {
@@ -335,6 +337,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         let pid = &pid;
         svc_stop(action_user, env, stop_way, pid.clone());
         let kill_timeout = &kill_timeout;
+        *&mut kill_timer = Some(timer(time::Duration::from_millis(kill_timeout.clone().try_into().unwrap())).unwrap());
         regsvc(&id, SvcStatus::Stopped);
     };
     let full_exec = || {
@@ -381,6 +384,24 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     let mut retry = true;
     loop {
         if svc_running_core(&id) == SvcStatus::Stopped {
+            let kill_timer = &mut kill_timer;
+            if kill_timer.is_some() {
+                let kill_timer_unwrap = kill_timer.as_ref().unwrap();
+            	if *kill_timer_unwrap.read().unwrap() {
+            		*kill_timer = None;
+            		if try_wait(pid).is_none() {
+            			send_signal(pid, SIGKILL);
+            		}
+            	}
+            	die_timer = Some(timer(time::Duration::from_secs(300)).unwrap());
+            } else if die_timer.is_some() {
+                let die_timer_unwrap = die_timer.as_ref().unwrap();
+            	if *die_timer_unwrap.read().unwrap() {
+            		delsvc(&id);
+            		delmsg(&id);
+            		return;
+            	}
+            }
         }
     	let msg = channel.try_recv();
     	if msg.is_ok() {
@@ -393,6 +414,10 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     					continue;
     				},
     			};
+    		} else if msg == "down" {
+    			full_stop();
+    		} else if msg == "up" {
+    			pid = full_exec();
     		}
     	}
     	let t = try_wait(pid);
@@ -434,7 +459,7 @@ fn svc_stop(action_user: &User, env: &str, stop_way: &Value, svc_pid: pid_t) -> 
 			};
 		},
 		Value::Integer(i) => {
-		    return send_signal(svc_pid, i.clone().try_into().unwrap_or(15));
+		    return send_signal(svc_pid, i.clone().try_into().unwrap_or(SIGTERM));
 		},
 		_ => {
 			return false;
@@ -487,6 +512,18 @@ fn svcid_detect(svctomlpath: &str) -> String {
     }
 }
 // End Service Supervisor
+fn timer(dur: time::Duration) -> Result<Arc<RwLock<bool>>, Box<dyn std::error::Error>> {
+	let thrd = Builder::new().name("timer".to_string());
+	let val = Arc::new(RwLock::new(false));
+	{
+	    let val = val.clone();
+	    thrd.spawn(move || {
+		    sleep(dur);
+		    (*val.write().unwrap()) = true;
+	    })?;
+	}
+	Ok(val)
+}
 fn send_signal(pid: pid_t, sig: c_int) -> bool {
     unsafe {
 	let rslt = kill(pid, sig);
@@ -952,6 +989,22 @@ fn enable_rw() {
             		let msg = &msg[6..];
             	} else if msg.starts_with("stop ") {
             		let msg = &msg[5..];
+            		let guard = false;
+            		if guard {
+            			unimplemented!();
+            		} else {
+            			let sp = sups.get(msg.clone());
+            			match sp {
+            				Some(a) => match a.send("down".as_bytes()) {
+            						Ok(_) => (),
+            						Err(_) => (),
+            					},
+            				None => match server.send("SvcNotRunning".as_bytes()) {
+            						    Ok(_) => (),
+            						    Err(_) => (),
+            					    },
+            			};
+            		}
             	} else if msg.starts_with("restart ") {
             		let msg = &msg[8..];
             	} else if msg.starts_with("status ") {
@@ -1055,12 +1108,6 @@ fn main() {
     milestones_dir.push("milestones");
     let milestones_dir = milestones_dir.to_string_lossy();
     stage_milestone_start(airup_home.clone(), &milestones_dir, &milestone);
-    let jh = rwmode.join();
-    if jh.is_err() {
-        println!(
-            "{}BUG: RW Mode daemon thread panicked: using loops!",
-            Red.paint(" * ")
-        );
-    }
+    rwmode.join().unwrap();
     loop {}
 }
