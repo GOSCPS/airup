@@ -1,3 +1,4 @@
 [svc]
 prompt = "b"
-exec = "echo Dependency-resolver works!"
+#exec = "echo Dependency-resolver works!"
+exec = "sleep 100"

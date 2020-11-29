@@ -1,18 +1,23 @@
 use ansi_term::Color::*;
-use libc::{getpid, kill, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, SIG_BLOCK, waitpid, WNOHANG, c_int, SIGKILL, SIGTERM};
+use libc::{
+    c_int, getpid, kill, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, waitpid, SIGKILL,
+    SIGTERM, SIG_BLOCK, WNOHANG,
+};
 use nng::{Protocol, Socket};
 use once_cell::sync::Lazy;
 use std::{
+    cell::{Cell, RefCell},
     cmp::PartialEq,
     collections::HashMap,
     convert::TryInto,
     env,
     fmt::{Display, Formatter},
-    fs, io, mem, panic, time,
+    fs, io, mem, panic,
     path::{Path, PathBuf},
     process::{exit, Command},
-    sync::{RwLock, Arc},
-    thread::{Builder, sleep},
+    sync::{Arc, RwLock},
+    thread::{sleep, Builder},
+    time,
 };
 use toml::{map::Map, Value};
 
@@ -32,7 +37,7 @@ impl Display for User {
 enum SvcStatus {
     Readying,
     Running,
-    Working,
+    Restarting,
     Stopped,
     Unmentioned,
 }
@@ -43,6 +48,7 @@ enum Stage {
     CtrlAltDel,
 }
 
+static AIRUP_GUARD_ENABLED: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 static COMM_INIT: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 static CURRENT_STAGE: Lazy<RwLock<Stage>> = Lazy::new(|| RwLock::new(Stage::PreStart));
 static AIRUP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -103,7 +109,9 @@ fn svc_running_core(id: &str) -> SvcStatus {
         .unwrap_or(&SvcStatus::Unmentioned)
 }
 fn svc_running_block(id: &str) -> bool {
-    if svc_running_core(id.clone()) == SvcStatus::Readying || svc_running_core(id.clone()) == SvcStatus::Working {
+    if svc_running_core(id.clone()) == SvcStatus::Readying
+        || svc_running_core(id.clone()) == SvcStatus::Restarting
+    {
         loop {
             if svc_running_core(id) == SvcStatus::Running {
                 return true;
@@ -181,9 +189,9 @@ fn svc_dep(airup_dir: &'static str, deps: Vec<String>) {
             );
         }
         loop {
-        	if svc_running_block(&dep) {
-        		break;
-        	}
+            if svc_running_block(&dep) {
+                break;
+            }
         }
     }
 }
@@ -266,11 +274,8 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     // Ready some basic values.
     let prompt = g_svc(&svctoml, "prompt").unwrap_or(Value::String(id.to_string()));
     let prompt = prompt.as_str().unwrap_or(id.clone()).to_string();
-    let desc = g_svc(&svctoml, "description")
-        .unwrap();
-    let desc = desc .as_str()
-        .unwrap()
-        .to_string();
+    let desc = g_svc(&svctoml, "description").unwrap();
+    let desc = desc.as_str().unwrap().to_string();
     let env_map = g_svc(&svctoml, "env_list").unwrap();
     let env_map = env_map.as_table().unwrap();
     let sh_env = envmaptostr(env_map);
@@ -278,10 +283,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     let action_user = g_svc(&svctoml, "action_user");
     let user = get_user_by_value(user);
     let action_user = get_user_by_value(action_user);
-    let take_io = g_svc(&svctoml, "take_io")
-        .unwrap()
-        .as_bool()
-        .unwrap();
+    let take_io = g_svc(&svctoml, "take_io").unwrap().as_bool().unwrap();
     let deps = g_svc(&svctoml, "dependencies").unwrap();
     let deps = deps.as_array().unwrap();
     let deps = vv_to_vs(deps.to_vec());
@@ -318,13 +320,36 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     let kill_timeout = g_svc(&svctoml, "kill_timeout").unwrap();
     let kill_timeout = kill_timeout.as_integer().unwrap();
     // ready functions
-    let mut pid = 0;
+    let pid = Cell::new(0);
     let id = String::from(id);
-    let mut kill_timer: Option<Arc<RwLock<bool>>> = None;
+    let kill_timer: RefCell<Option<Arc<RwLock<bool>>>> = RefCell::new(None);
     let mut die_timer: Option<Arc<RwLock<bool>>> = None;
-    let mut full_stop = || {
-    	let pre_stop = &pre_stop;
-    	let stop_way = &stop_way;
+    let cleanup_now = || {
+        let cleanup = &cleanup;
+        if cleanup.is_some() {
+            let cleanup = cleanup.as_ref().unwrap();
+            if cleanup.is_str() {
+                let cleanup = cleanup.as_str().unwrap().to_string();
+                match asystem(&action_user, &cleanup, &sh_env) {
+                    Some(a) => {
+                        wait(a);
+                    }
+                    None => {
+                        eprintln!(
+                            "{}Failed to cleanup service {}: failed to run cleanup command \"{}\"!",
+                            Red.paint(" * "),
+                            &id,
+                            &cleanup
+                        );
+                        return;
+                    }
+                };
+            }
+        }
+    };
+    let full_stop = || {
+        let pre_stop = &pre_stop;
+        let stop_way = &stop_way;
         if pre_stop.is_some() {
             let pre_stop = pre_stop.as_ref().unwrap();
             let pre_pid = asystem(&action_user, pre_stop.as_str().unwrap(), &sh_env);
@@ -334,166 +359,275 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         }
         let action_user = &action_user;
         let env = &sh_env;
-        let pid = &pid;
+        let pid = (&pid).get();
         svc_stop(action_user, env, stop_way, pid.clone());
         let kill_timeout = &kill_timeout;
-        *&mut kill_timer = Some(timer(time::Duration::from_millis(kill_timeout.clone().try_into().unwrap())).unwrap());
+        *(&kill_timer).borrow_mut() = Some(
+            timer(time::Duration::from_millis(
+                kill_timeout.clone().try_into().unwrap(),
+            ))
+            .unwrap(),
+        );
         regsvc(&id, SvcStatus::Stopped);
+    };
+    let full_restart = || {
+        let pre_restart = &pre_restart;
+        let restart_way = &restart_way;
+        if pre_stop.is_some() {
+            let pre_restart = pre_restart.as_ref().unwrap();
+            let pre_pid = asystem(&action_user, pre_restart.as_str().unwrap(), &sh_env);
+            if pre_pid.is_some() {
+                wait(pre_pid.unwrap());
+            }
+        }
+        let pid = (&pid).get();
+        svc_stop(&action_user, &sh_env, restart_way, pid.clone());
+        let kill_timeout = &kill_timeout;
+        *(&kill_timer).borrow_mut() = Some(
+            timer(time::Duration::from_millis(
+                kill_timeout.clone().try_into().unwrap(),
+            ))
+            .unwrap(),
+        );
+        regsvc(&id, SvcStatus::Restarting);
     };
     let full_exec = || {
         let pre_exec = &pre_exec;
         if pre_exec.is_some() {
             let pre_exec = pre_exec.as_ref().unwrap();
-    	    let pre_pid = asystem(&action_user, pre_exec.as_str().unwrap(), &sh_env);
-    	    if pre_pid.is_some() {
-    		    wait(pre_pid.unwrap());
-    	    }
+            let pre_pid = asystem(&action_user, pre_exec.as_str().unwrap(), &sh_env);
+            if pre_pid.is_some() {
+                wait(pre_pid.unwrap());
+            }
         }
-    	let pid = svc_exec(&user, &sh_env, &exec, take_io, &pid_file);
-    	if pid.is_none() {
-    		eprintln!("{}Failed to execute service {}!", Red.paint(" * "), Red.paint(prompt.clone()));
-    		return 0;
-    	} else {
-    	    let ready_timeout = &ready_timeout;
-    	    if ready_timeout.is_some() {
+        let pid = svc_exec(&user, &sh_env, &exec, take_io, &pid_file);
+        if pid.is_none() {
+            eprintln!(
+                "{}Failed to execute service {}!",
+                Red.paint(" * "),
+                Red.paint(prompt.clone())
+            );
+            return 0;
+        } else {
+            let ready_timeout = &ready_timeout;
+            if ready_timeout.is_some() {
                 let ready_timeout = ready_timeout.as_ref().unwrap();
                 let ready_timeout = ready_timeout.as_integer().unwrap();
                 let ready_timeout = match ready_timeout.try_into() {
-                	Ok(a) => a,
-                	Err(_) => {
-                		eprintln!("{}{}: Timeout must be more than zero!", Red.paint(" * "), prompt.clone());
+                    Ok(a) => a,
+                    Err(_) => {
+                        eprintln!(
+                            "{}{}: Timeout must be more than zero!",
+                            Red.paint(" * "),
+                            prompt.clone()
+                        );
                         return 0;
-                	},
+                    }
                 };
-    		    sleep(time::Duration::from_millis(ready_timeout));
-    	    }	
-    	}
-    	let pid = pid.unwrap();
-    	pid
+                sleep(time::Duration::from_millis(ready_timeout));
+            }
+        }
+        let pid = pid.unwrap();
+        pid
     };
     // startup first
-    pid = full_exec();
-    if pid == 0 {
-        eprintln!("{}Failed to start service {}!", Red.paint(" * "), Red.paint(prompt.clone()));
-    	return;
+    pid.set(full_exec());
+    if pid.get() == 0 {
+        eprintln!(
+            "{}Failed to start service {}!",
+            Red.paint(" * "),
+            Red.paint(prompt.clone())
+        );
+        return;
     }
     regsvc(&id, SvcStatus::Running);
-    println!("{}Starting service {}({})...", Green.paint(" * "), Green.paint(prompt.clone()), Blue.paint(desc.clone()));
+    println!(
+        "{}Starting service {}({})...",
+        Green.paint(" * "),
+        Green.paint(prompt.clone()),
+        Blue.paint(desc.clone())
+    );
     // observe
     let mut retry_count = 0;
     let mut retry = true;
     loop {
         if svc_running_core(&id) == SvcStatus::Stopped {
-            let kill_timer = &mut kill_timer;
-            if kill_timer.is_some() {
-                let kill_timer_unwrap = kill_timer.as_ref().unwrap();
-            	if *kill_timer_unwrap.read().unwrap() {
-            		*kill_timer = None;
-            		if try_wait(pid).is_none() {
-            			send_signal(pid, SIGKILL);
-            		}
-            	}
-            	die_timer = Some(timer(time::Duration::from_secs(300)).unwrap());
+            if (*(&kill_timer).borrow()).is_some() {
+                let kill_timer_unwrap = (&kill_timer).borrow_mut();
+                let kill_timer_unwrap = kill_timer_unwrap.as_ref();
+                let kill_timer_unwrap = kill_timer_unwrap.unwrap();
+                if *kill_timer_unwrap.read().unwrap() {
+                    *(&kill_timer).borrow_mut() = None;
+                    if try_wait(pid.get()).is_none() {
+                        eprintln!("{}Failed to stop service {} normally: Attempting to kill service!", Red.paint(" * "), &id);
+                        send_signal(pid.get(), SIGKILL);
+                    }
+                }
+                die_timer = Some(timer(time::Duration::from_secs(300)).unwrap());
+                cleanup_now();
+                pid.set(0);
             } else if die_timer.is_some() {
                 let die_timer_unwrap = die_timer.as_ref().unwrap();
-            	if *die_timer_unwrap.read().unwrap() {
-            		delsvc(&id);
-            		delmsg(&id);
-            		return;
-            	}
+                if *die_timer_unwrap.read().unwrap() {
+                    delsvc(&id);
+                    delmsg(&id);
+                    return;
+                }
             }
         }
-    	let msg = channel.try_recv();
-    	if msg.is_ok() {
-    		let msg = msg.unwrap();
-    		let msg = String::from_utf8_lossy(&msg);
-    		if msg == "pid" {
-    			match channel.send(pid.to_string().as_bytes()) {
-    				Ok(_) => (),
-    				Err(_) => {
-    					continue;
-    				},
-    			};
-    		} else if msg == "down" {
-    			full_stop();
-    		} else if msg == "up" {
-    			pid = full_exec();
-    		}
-    	}
-    	let t = try_wait(pid);
-    	if t.is_some() {
-    	    let t = t.unwrap();
-    	    if t == 0 && retry && !(retry_count == retry_time) {
-    	    	eprintln!("{}Service {} stopped, but not returning an error. restarting...", Yellow.paint(" * "), Yellow.paint(prompt.clone()));
-    	    } else if t !=0 && retry && !(retry_count == retry_time) {
-    	    	eprintln!("{}Service {} stopped unexpectedly! restarting...", Red.paint(" * "), Red.paint(prompt.clone()));
-    	    }
-    	    if retry_count == retry_time && retry {
-    	    	eprintln!("{}Service {} restarted too many times!", Red.paint(" * "), Red.paint(prompt.clone()));
+        let msg = channel.try_recv();
+        if msg.is_ok() {
+            let msg = msg.unwrap();
+            let msg = String::from_utf8_lossy(&msg);
+            if msg == "pid" {
+                match channel.send(pid.get().to_string().as_bytes()) {
+                    Ok(_) => (),
+                    Err(_) => {
+                        continue;
+                    }
+                };
+            } else if msg == "down" {
+                retry_count = 0;
+                retry = true;
+                full_stop();
+            } else if msg == "up" {
+                retry_count = 0;
+                retry = true;
+                pid.set(full_exec());
+            } else if msg == "restart" {
+                retry_count = 0;
+                retry = true;
+                full_restart();
+            }
+        }
+        if svc_running_core(&id) == SvcStatus::Restarting && (*(&kill_timer).borrow()).is_some() {
+            let kill_timer_unwrap = (&kill_timer).borrow_mut();
+            let kill_timer_unwrap = kill_timer_unwrap.as_ref();
+            let kill_timer_unwrap = kill_timer_unwrap.unwrap();
+            if *kill_timer_unwrap.read().unwrap() {
+                *(&kill_timer).borrow_mut() = None;
+                if try_wait(pid.get()).is_none() {
+                    eprintln!("{}Failed to stop service {} normally: Attempting to kill service!", Red.paint(" * "), &id);
+                    send_signal(pid.get(), SIGKILL);
+                }
+            }
+            if cleanup_on_restart {
+                cleanup_now();
+            }
+            let a = svc_exec(&user, &sh_env, &exec, take_io, &pid_file);
+            if a.is_some() {
+                let a = a.unwrap();
+                pid.set(a);
+            } else {
+                eprintln!(
+                    "{}Failed to execute service {}!",
+                    Red.paint(" * "),
+                    Red.paint(prompt.clone())
+                );
+                pid.set(0);
+            }
+        }
+        let t = try_wait(pid.get());
+        if t.is_some() {
+            let t = t.unwrap();
+            if t == 0 && retry && !(retry_count == retry_time) {
+                eprintln!(
+                    "{}Service {} stopped, but not returning an error. restarting...",
+                    Yellow.paint(" * "),
+                    Yellow.paint(prompt.clone())
+                );
+            } else if t != 0 && retry && !(retry_count == retry_time) {
+                eprintln!(
+                    "{}Service {} stopped unexpectedly! restarting...",
+                    Red.paint(" * "),
+                    Red.paint(prompt.clone())
+                );
+            }
+            if retry_count == retry_time && retry {
+                eprintln!(
+                    "{}Service {} restarted too many times!",
+                    Red.paint(" * "),
+                    Red.paint(prompt.clone())
+                );
+                regsvc(&id, SvcStatus::Stopped);
                 retry = false;
-    	    } else if retry_count != retry_time && retry {
-    	    	retry_count += 1;
-    	    	regsvc(&id, SvcStatus::Readying);
-    	    	pid = full_exec();
-    	    	if pid == 0 {
-    	    		eprintln!("{}Failed to restart service {}!", Red.paint(" * "), Red.paint(prompt.clone()));
-    	    		continue;
-    	    	}
-    	    	regsvc(&id, SvcStatus::Running);
-    	    }
-    	}
+            } else if retry_count != retry_time && retry {
+                retry_count += 1;
+                regsvc(&id, SvcStatus::Readying);
+                pid.set(full_exec());
+                if pid.get() == 0 {
+                    eprintln!(
+                        "{}Failed to restart service {}!",
+                        Red.paint(" * "),
+                        Red.paint(prompt.clone())
+                    );
+                    continue;
+                }
+                regsvc(&id, SvcStatus::Running);
+            }
+        }
     }
 }
 fn svc_stop(action_user: &User, env: &str, stop_way: &Value, svc_pid: pid_t) -> bool {
-	match stop_way {
-		Value::String(s) => {
-			let p = asystem(&action_user, &s.replace("${PID}", &svc_pid.to_string()), env.clone());
-			match p {
-				Some(a) => {
-					wait(a);
-					return true;
-				},
-				None => {
-					return false;
-				},
-			};
-		},
-		Value::Integer(i) => {
-		    return send_signal(svc_pid, i.clone().try_into().unwrap_or(SIGTERM));
-		},
-		_ => {
-			return false;
-		},
-	};
+    match stop_way {
+        Value::String(s) => {
+            let p = asystem(
+                &action_user,
+                &s.replace("${PID}", &svc_pid.to_string()),
+                env.clone(),
+            );
+            match p {
+                Some(a) => {
+                    wait(a);
+                    return true;
+                }
+                None => {
+                    return false;
+                }
+            };
+        }
+        Value::Integer(i) => {
+            return send_signal(svc_pid, i.clone().try_into().unwrap_or(SIGTERM));
+        }
+        _ => {
+            return false;
+        }
+    };
 }
-fn svc_exec(user: &User, env: &str, exec: &str, take_io: bool, pid_file: &Option<Value>) -> Option<pid_t> {
-	let mut p = asystem(&user, exec.clone(), env.clone());
-	if pid_file.is_some() {
-		let pid_file = pid_file.as_ref().unwrap();
-		if !pid_file.is_str() {
-			eprintln!("{}Invalid value.", Red.paint(" * "));
-			return svc_exec(user, exec, env, take_io, &None);
-		}
-		let pid_file = pid_file.clone();
-		let pid_file = pid_file.as_str().unwrap();
-		let mut pid = String::new();
-		loop {
-			if Path::new(pid_file.clone()).exists() {
-				pid = fs::read_to_string(pid_file.clone()).unwrap();
-				break;
-			}
-		}
-		let pid = pid.parse::<pid_t>();
-		p = match pid {
-			Ok(a) => Some(a),
-			Err(_) => {
-				eprintln!("{}PID file format error!", Red.paint(" * "));
-				return svc_exec(user, exec, env, take_io, &None);
-			},
-		};
-	}
-	//Abort take_io until airpnv instead of airup_su
-	p
+fn svc_exec(
+    user: &User,
+    env: &str,
+    exec: &str,
+    take_io: bool,
+    pid_file: &Option<Value>,
+) -> Option<pid_t> {
+    let mut p = asystem(&user, exec.clone(), env.clone());
+    if pid_file.is_some() {
+        let pid_file = pid_file.as_ref().unwrap();
+        if !pid_file.is_str() {
+            eprintln!("{}Invalid value.", Red.paint(" * "));
+            return svc_exec(user, exec, env, take_io, &None);
+        }
+        let pid_file = pid_file.clone();
+        let pid_file = pid_file.as_str().unwrap();
+        let mut pid_str = String::new();
+        loop {
+            if Path::new(pid_file.clone()).exists() {
+                pid_str = fs::read_to_string(pid_file.clone()).unwrap();
+                break;
+            }
+        }
+        let pid = pid_str.parse::<pid_t>();
+        p = match pid {
+            Ok(a) => Some(a),
+            Err(_) => {
+                eprintln!("{}PID file format error!", Red.paint(" * "));
+                return svc_exec(user, exec, env, take_io, &None);
+            }
+        };
+    }
+    //Abort take_io until airpnv instead of airup_su
+    p
 }
 fn svcid_detect(svctomlpath: &str) -> String {
     if fs::symlink_metadata(svctomlpath.clone())
@@ -513,42 +647,42 @@ fn svcid_detect(svctomlpath: &str) -> String {
 }
 // End Service Supervisor
 fn timer(dur: time::Duration) -> Result<Arc<RwLock<bool>>, Box<dyn std::error::Error>> {
-	let thrd = Builder::new().name("timer".to_string());
-	let val = Arc::new(RwLock::new(false));
-	{
-	    let val = val.clone();
-	    thrd.spawn(move || {
-		    sleep(dur);
-		    (*val.write().unwrap()) = true;
-	    })?;
-	}
-	Ok(val)
+    let thrd = Builder::new().name("timer".to_string());
+    let val = Arc::new(RwLock::new(false));
+    {
+        let val = val.clone();
+        thrd.spawn(move || {
+            sleep(dur);
+            (*val.write().unwrap()) = true;
+        })?;
+    }
+    Ok(val)
 }
 fn send_signal(pid: pid_t, sig: c_int) -> bool {
     unsafe {
-	let rslt = kill(pid, sig);
-	if rslt == 0 {
-		return true;
-	}
-	false
-	}
+        let rslt = kill(pid, sig);
+        if rslt == 0 {
+            return true;
+        }
+        false
+    }
 }
 fn try_wait(pid: pid_t) -> Option<c_int> {
-	unsafe {
-		let mut status: c_int = 0;
-		let wait_status = waitpid(pid, &mut status as *mut c_int, WNOHANG);
-		if wait_status == 0 {
-			return None;
-		} else {
-			return Some(status);
-		}
-	}
+    unsafe {
+        let mut status: c_int = 0;
+        let wait_status = waitpid(pid, &mut status as *mut c_int, WNOHANG);
+        if wait_status == 0 {
+            return None;
+        } else {
+            return Some(status);
+        }
+    }
 }
 fn wait(pid: pid_t) -> c_int {
     unsafe {
-    	let mut status: c_int = 0;
-    	waitpid(pid, &mut status as *mut c_int, 0);
-    	return status;
+        let mut status: c_int = 0;
+        waitpid(pid, &mut status as *mut c_int, 0);
+        return status;
     }
 }
 fn stage_prestart_exec(dir: &str, paral: bool) {
@@ -609,8 +743,8 @@ fn asystem(user: &User, cmd: &str, env_list: &str) -> Option<pid_t> {
     #[cfg(not(feature = "no_airupsu"))]
     {
         let mode: &str = match user {
-        	Id(_) => "--uid",
-        	Name(_) => -u,
+            User::Id(_) => "--uid",
+            User::Name(_) => "-u",
         };
         let user = user.to_string();
         let a = Command::new("airup_su")
@@ -755,7 +889,9 @@ fn set_airenv(ms: &str, ad: &str, par: bool) {
     env::set_var("AIRUP_PARAL_PRESTART", par.to_string());
 }
 fn set_panic() {
-    panic::set_hook(Box::new(|panic_info| ()));
+    panic::set_hook(Box::new(|panic_info| {
+        eprintln!("{}{}", Red.paint(" * "), panic_info);
+    }));
 }
 // The following function is made for "dependencies" toml object resolving.
 fn vv_to_vs(vv: Vec<Value>) -> Vec<String> {
@@ -984,80 +1120,108 @@ fn enable_rw() {
             let msg = msg.unwrap();
             let msg = String::from_utf8_lossy(msg.as_slice());
             if msg.starts_with("svc ") {
-            	let msg = &msg[4..];
-            	if msg.starts_with("start ") {
-            		let msg = &msg[6..];
-            	} else if msg.starts_with("stop ") {
-            		let msg = &msg[5..];
-            		let guard = false;
-            		if guard {
-            			unimplemented!();
-            		} else {
-            			let sp = sups.get(msg.clone());
-            			match sp {
-            				Some(a) => match a.send("down".as_bytes()) {
-            						Ok(_) => (),
-            						Err(_) => (),
-            					},
-            				None => match server.send("SvcNotRunning".as_bytes()) {
-            						    Ok(_) => (),
-            						    Err(_) => (),
-            					    },
-            			};
-            		}
-            	} else if msg.starts_with("restart ") {
-            		let msg = &msg[8..];
-            	} else if msg.starts_with("status ") {
-            		let msg = &msg[7..];
-            		let sp = sups.get(msg.clone());
-            		match sp {
-            			Some(a) => {
-            				let status = svc_running_core(msg);
-            				let status_str = match status {
-            					SvcStatus::Readying => "Readying",
-            					SvcStatus::Running => "Running",
-            					SvcStatus::Working => "Working",
-            					SvcStatus::Stopped => "Stopped",
-            					SvcStatus::Unmentioned => "SvcNotRunning",
-            				};
-            				let pid = match status {
-            					SvcStatus::Running => {
-            						match a.send("pid".as_bytes()) {
-            							Ok(_) => {
-            								match a.recv() {
-            									Ok(msg) => {
-            										String::from_utf8_lossy(msg.as_slice()).to_string()
-            									},
-            									Err(_) => "0".to_string(),
-            								}
-            							},
-            							Err(_) => "0".to_string(),
-            						}
-            					},
-            					_ => "0".to_string(),
-            				};
-            				let mut newmsg = String::from(status_str);
-            				newmsg.push(' ');
-            				newmsg.push_str(&pid);
-            				match server.send(newmsg.as_bytes()) {
-            					Ok(_) => (),
-            					Err(_) => {
-            						continue;
-            					},
-            				};
-            			},
-            			None => {
-            				match server.send("SvcNotRunning".as_bytes()) {
-            					Ok(_) => (),
-            					Err(_) => {
-            						continue;
-            					},
-            				};
-            			},
-            		};
-            	}
+                let msg = &msg[4..];
+                if msg.starts_with("start ") {
+                    let msg = &msg[6..];
+                    let guard = false;
+                    if guard {
+                        unimplemented!();
+                    } else {
+                        let sp = sups.get(msg.clone());
+                        match sp {
+                            Some(a) => match a.send("up".as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => (),
+                            },
+                            None => match server.send("SvcNotRunning".as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => (),
+                            },
+                        };
+                    }
+                } else if msg.starts_with("stop ") {
+                    let msg = &msg[5..];
+                    let guard = false;
+                    if guard {
+                        unimplemented!();
+                    } else {
+                        let sp = sups.get(msg.clone());
+                        match sp {
+                            Some(a) => match a.send("down".as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => (),
+                            },
+                            None => match server.send("SvcNotRunning".as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => (),
+                            },
+                        };
+                    }
+                } else if msg.starts_with("restart ") {
+                    let msg = &msg[8..];
+                    let guard = false;
+                    if guard {
+                        unimplemented!();
+                    } else {
+                        let sp = sups.get(msg.clone());
+                        match sp {
+                            Some(a) => match a.send("restart".as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => (),
+                            },
+                            None => match server.send("SvcNotRunning".as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => (),
+                            },
+                        };
+                    }
+                } else if msg.starts_with("status ") {
+                    let msg = &msg[7..];
+                    let sp = sups.get(msg.clone());
+                    match sp {
+                        Some(a) => {
+                            let status = svc_running_core(msg);
+                            let status_str = match status {
+                                SvcStatus::Readying => "Readying",
+                                SvcStatus::Running => "Running",
+                                SvcStatus::Restarting => "Restarting",
+                                SvcStatus::Stopped => "Stopped",
+                                SvcStatus::Unmentioned => "SvcNotRunning",
+                            };
+                            let pid = match status {
+                                SvcStatus::Running => match a.send("pid".as_bytes()) {
+                                    Ok(_) => match a.recv() {
+                                        Ok(msg) => {
+                                            String::from_utf8_lossy(msg.as_slice()).to_string()
+                                        }
+                                        Err(_) => "0".to_string(),
+                                    },
+                                    Err(_) => "0".to_string(),
+                                },
+                                _ => "0".to_string(),
+                            };
+                            let mut newmsg = String::from(status_str);
+                            newmsg.push(' ');
+                            newmsg.push_str(&pid);
+                            match server.send(newmsg.as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => {
+                                    continue;
+                                }
+                            };
+                        }
+                        None => {
+                            match server.send("SvcNotRunning".as_bytes()) {
+                                Ok(_) => (),
+                                Err(_) => {
+                                    continue;
+                                }
+                            };
+                        }
+                    };
+                }
             } else if msg.starts_with("system ") {
-            	let msg = &msg[7..];
+                let msg = &msg[7..];
             }
         }
     }
