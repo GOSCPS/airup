@@ -6,7 +6,7 @@ use libc::{
 use nng::{Protocol, Socket};
 use once_cell::sync::Lazy;
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     cmp::PartialEq,
     collections::HashMap,
     convert::TryInto,
@@ -15,7 +15,10 @@ use std::{
     fs, io, mem, panic,
     path::{Path, PathBuf},
     process::{exit, Command},
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, RwLock,
+    },
     thread::{sleep, Builder},
     time,
 };
@@ -322,8 +325,8 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     // ready functions
     let pid = Cell::new(0);
     let id = String::from(id);
-    let kill_timer: RefCell<Option<Arc<RwLock<bool>>>> = RefCell::new(None);
-    let mut die_timer: Option<Arc<RwLock<bool>>> = None;
+    let kill_timer: Arc<AtomicU8> = Arc::new(AtomicU8::new(0));
+    let die_timer: Arc<AtomicU8> = Arc::new(AtomicU8::new(0));
     let cleanup_now = || {
         let cleanup = &cleanup;
         if cleanup.is_some() {
@@ -362,11 +365,9 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         let pid = (&pid).get();
         svc_stop(action_user, env, stop_way, pid.clone());
         let kill_timeout = &kill_timeout;
-        *(&kill_timer).borrow_mut() = Some(
-            timer(time::Duration::from_millis(
-                kill_timeout.clone().try_into().unwrap(),
-            ))
-            .unwrap(),
+        timer(
+            time::Duration::from_millis(kill_timeout.clone().try_into().unwrap()),
+            kill_timer.clone(),
         );
         regsvc(&id, SvcStatus::Stopped);
     };
@@ -383,11 +384,9 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         let pid = (&pid).get();
         svc_stop(&action_user, &sh_env, restart_way, pid.clone());
         let kill_timeout = &kill_timeout;
-        *(&kill_timer).borrow_mut() = Some(
-            timer(time::Duration::from_millis(
-                kill_timeout.clone().try_into().unwrap(),
-            ))
-            .unwrap(),
+        timer(
+            time::Duration::from_millis(kill_timeout.clone().try_into().unwrap()),
+            kill_timer.clone(),
         );
         regsvc(&id, SvcStatus::Restarting);
     };
@@ -452,23 +451,23 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     let mut retry = true;
     loop {
         if svc_running_core(&id) == SvcStatus::Stopped {
-            if (*(&kill_timer).borrow()).is_some() {
-                let kill_timer_unwrap = (&kill_timer).borrow_mut();
-                let kill_timer_unwrap = kill_timer_unwrap.as_ref();
-                let kill_timer_unwrap = kill_timer_unwrap.unwrap();
-                if *kill_timer_unwrap.read().unwrap() {
-                    *(&kill_timer).borrow_mut() = None;
+            if kill_timer.load(Ordering::Relaxed) != 0 {
+                if kill_timer.load(Ordering::Relaxed) == 2 {
+                    kill_timer.store(0, Ordering::Relaxed);
                     if try_wait(pid.get()).is_none() {
-                        eprintln!("{}Failed to stop service {} normally: Attempting to kill service!", Red.paint(" * "), &id);
+                        eprintln!(
+                            "{}Failed to stop service {} normally: Attempting to kill service!",
+                            Red.paint(" * "),
+                            &id
+                        );
                         send_signal(pid.get(), SIGKILL);
                     }
                 }
-                die_timer = Some(timer(time::Duration::from_secs(300)).unwrap());
+                timer(time::Duration::from_secs(300), die_timer.clone());
                 cleanup_now();
                 pid.set(0);
-            } else if die_timer.is_some() {
-                let die_timer_unwrap = die_timer.as_ref().unwrap();
-                if *die_timer_unwrap.read().unwrap() {
+            } else if die_timer.load(Ordering::Relaxed) != 0 {
+                if die_timer.load(Ordering::Relaxed) == 2 {
                     delsvc(&id);
                     delmsg(&id);
                     return;
@@ -500,14 +499,16 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
                 full_restart();
             }
         }
-        if svc_running_core(&id) == SvcStatus::Restarting && (*(&kill_timer).borrow()).is_some() {
-            let kill_timer_unwrap = (&kill_timer).borrow_mut();
-            let kill_timer_unwrap = kill_timer_unwrap.as_ref();
-            let kill_timer_unwrap = kill_timer_unwrap.unwrap();
-            if *kill_timer_unwrap.read().unwrap() {
-                *(&kill_timer).borrow_mut() = None;
+        if svc_running_core(&id) == SvcStatus::Restarting && kill_timer.load(Ordering::Relaxed) != 0
+        {
+            if kill_timer.load(Ordering::Relaxed) == 2 {
+                kill_timer.store(0, Ordering::Relaxed);
                 if try_wait(pid.get()).is_none() {
-                    eprintln!("{}Failed to stop service {} normally: Attempting to kill service!", Red.paint(" * "), &id);
+                    eprintln!(
+                        "{}Failed to stop service {} normally: Attempting to kill service!",
+                        Red.paint(" * "),
+                        &id
+                    );
                     send_signal(pid.get(), SIGKILL);
                 }
             }
@@ -646,17 +647,17 @@ fn svcid_detect(svctomlpath: &str) -> String {
     }
 }
 // End Service Supervisor
-fn timer(dur: time::Duration) -> Result<Arc<RwLock<bool>>, Box<dyn std::error::Error>> {
+fn timer(dur: time::Duration, m: Arc<AtomicU8>) -> Result<(), Box<dyn std::error::Error>> {
     let thrd = Builder::new().name("timer".to_string());
-    let val = Arc::new(RwLock::new(false));
     {
-        let val = val.clone();
+        let val = m.clone();
         thrd.spawn(move || {
+            val.store(1, Ordering::Relaxed);
             sleep(dur);
-            (*val.write().unwrap()) = true;
+            val.store(2, Ordering::Relaxed);
         })?;
     }
-    Ok(val)
+    Ok(())
 }
 fn send_signal(pid: pid_t, sig: c_int) -> bool {
     unsafe {
