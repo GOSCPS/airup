@@ -351,6 +351,9 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         }
     };
     let full_stop = || {
+        if svc_running_core(&id) == SvcStatus::Stopped {
+        	return;
+        }
         let pre_stop = &pre_stop;
         let stop_way = &stop_way;
         if pre_stop.is_some() {
@@ -372,6 +375,9 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         regsvc(&id, SvcStatus::Stopped);
     };
     let full_restart = || {
+        if svc_running_core(&id) == SvcStatus::Stopped {
+        	return;
+        }
         let pre_restart = &pre_restart;
         let restart_way = &restart_way;
         if pre_stop.is_some() {
@@ -487,7 +493,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
                 };
             } else if msg == "down" {
                 retry_count = 0;
-                retry = true;
+                retry = false;
                 full_stop();
             } else if msg == "up" {
                 retry_count = 0;

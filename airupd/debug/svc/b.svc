@@ -2,3 +2,4 @@
 prompt = "b"
 #exec = "echo Dependency-resolver works!"
 exec = "sleep 100"
+stop_way = 9
