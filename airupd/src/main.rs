@@ -1,3 +1,5 @@
+mod power;
+
 use ansi_term::Color::*;
 use libc::{
     c_int, getpid, kill, pid_t, sigfillset, sigprocmask, sigset_t, uid_t, waitpid, SIGKILL,
@@ -12,7 +14,9 @@ use std::{
     convert::TryInto,
     env,
     fmt::{Display, Formatter},
-    fs, io, mem, panic,
+    fs,
+    fs::ReadDir,
+    io, mem, panic,
     path::{Path, PathBuf},
     process::{exit, Command},
     sync::{
@@ -44,6 +48,7 @@ enum SvcStatus {
     Stopped,
     Unmentioned,
 }
+#[derive(PartialEq)]
 enum Stage {
     PreStart,
     Milestones(String),
@@ -105,7 +110,28 @@ static AIRUP_CONF: &str = "/etc/airup.conf";
 #[cfg(feature = "quickdbg")]
 static AIRUP_CONF: &str = "debug/airup.conf";
 
-// Start Service Suoervisor
+fn pre_shutdown(ah: &str) {
+    println!("{}THIS COMPUTER IS SHUTTING DOWN...", Yellow.paint(" * "));
+    let mut ah = PathBuf::from(ah);
+    ah.push("shutdown");
+    let mut psh = ah.clone();
+    psh.push("pre");
+    let files = airup_read_dir(fs::read_dir(psh).unwrap());
+    for i in files {
+        system(&i);
+    }
+    println!("{}Executing pre-shutdown services...", Green.paint(" * "));
+    *CURRENT_STAGE.write().unwrap() = Stage::Shutdown;
+    println!("{}Calling service supervisors to stop...", Green.paint(" * "));
+    let mut msh = ah.clone();
+    msh.push("cleanup");
+    let files = airup_read_dir(fs::read_dir(msh).unwrap());
+    for i in files {
+        system(&i);
+    }
+    println!("{}Executing cleanup services...", Green.paint(" * "));
+}
+// Start Service Supervisor
 fn svc_running_core(id: &str) -> SvcStatus {
     *(*SVC_STATUS.read().unwrap())
         .get(id)
@@ -352,7 +378,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     };
     let full_stop = || {
         if svc_running_core(&id) == SvcStatus::Stopped {
-        	return;
+            return;
         }
         let pre_stop = &pre_stop;
         let stop_way = &stop_way;
@@ -376,7 +402,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
     };
     let full_restart = || {
         if svc_running_core(&id) == SvcStatus::Stopped {
-        	return;
+            return;
         }
         let pre_restart = &pre_restart;
         let restart_way = &restart_way;
@@ -453,9 +479,14 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         Blue.paint(desc.clone())
     );
     // observe
+    let mut st_a = false;
     let mut retry_count = 0;
     let mut retry = true;
     loop {
+        if *CURRENT_STAGE.read().unwrap() == Stage::Shutdown && !st_a {
+            st_a = true;
+            full_stop();
+        }
         if svc_running_core(&id) == SvcStatus::Stopped {
             if kill_timer.load(Ordering::Relaxed) != 0 {
                 if kill_timer.load(Ordering::Relaxed) == 2 {
@@ -982,11 +1013,7 @@ fn milestone_exec(ad: &str, dir: &str) {
         );
         return;
     }
-    let _files: Vec<io::Result<fs::DirEntry>> = _files.unwrap().collect();
-    let mut files: Vec<String> = Vec::new();
-    for i in _files.iter() {
-        files.push(i.as_ref().unwrap().path().to_string_lossy().to_string());
-    }
+    let files = airup_read_dir(_files.unwrap());
     // Action
     toml_env_setup(env);
     println!(
@@ -1014,7 +1041,16 @@ fn milestone_exec(ad: &str, dir: &str) {
     if paral {
         milestone_svcexec(Box::leak(ad.to_string().into_boxed_str()), files);
     } else {
+        unimplemented!();
     }
+}
+fn airup_read_dir(_files: ReadDir) -> Vec<String> {
+    let _files: Vec<io::Result<fs::DirEntry>> = _files.collect();
+    let mut files: Vec<String> = Vec::new();
+    for i in _files.iter() {
+        files.push(i.as_ref().unwrap().path().to_string_lossy().to_string());
+    }
+    files
 }
 fn milestone_svcexec(ad: &'static str, files: Vec<String>) {
     for i in files {
@@ -1029,7 +1065,7 @@ fn stage_milestone_start(ad: &str, dir: &str, milestone: &str) {
     dir.push(milestone);
     milestone_exec(ad, &dir.to_string_lossy());
 }
-fn enable_rw() {
+fn enable_rw(ah: &str) {
     let address = "tcp://127.0.0.1:61257";
     let server = Socket::new(Protocol::Rep0);
     let server = match server {
@@ -1229,6 +1265,13 @@ fn enable_rw() {
                 }
             } else if msg.starts_with("system ") {
                 let msg = &msg[7..];
+                if msg == "poweroff" {
+                    pre_shutdown(ah.clone());
+                    power::poweroff();
+                } else if msg == "reboot" {
+                    pre_shutdown(ah.clone());
+                    power::restart();
+                }
             }
         }
     }
@@ -1254,6 +1297,7 @@ fn main() {
     let milestone = get_milestone();
     let airup_home = g_airupconf(airup_conf.as_ref(), "airup_home");
     let airup_home = airup_home.as_str().unwrap();
+    let airup_home = &*Box::leak(airup_home.to_string().into_boxed_str());
     let prestart_paral = g_airupconf(airup_conf.as_ref(), "prestart_paral");
     let prestart_paral = prestart_paral.as_bool().unwrap();
     set_airenv(&milestone, airup_home.clone(), prestart_paral);
@@ -1269,7 +1313,7 @@ fn main() {
         prestart_paral,
     );
     let thrd = Builder::new().name("ipcmgr".to_string());
-    let rwmode = thrd.spawn(|| enable_rw()).unwrap();
+    let rwmode = thrd.spawn(move || enable_rw(airup_home.clone())).unwrap();
     loop {
         if (*COMM_INIT.read().unwrap()) == true {
             break;

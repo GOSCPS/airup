@@ -1,6 +1,6 @@
 [package]
 name = "airupd"
-version = "0.0.1"
+version = "0.1.0"
 license = "Unlicense"
 authors = ["sisungo <otelve@outlook.com>"]
 edition = "2018"
