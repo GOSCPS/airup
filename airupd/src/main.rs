@@ -110,13 +110,13 @@ static AIRUP_CONF: &str = "/etc/airup.conf";
 #[cfg(feature = "quickdbg")]
 static AIRUP_CONF: &str = "debug/airup.conf";
 
-fn pre_shutdown(ah: &str) {
+fn pre_shutdown(ah: &str) -> Result<(), Box<dyn std::error::Error>> {
     println!("{}THIS COMPUTER IS SHUTTING DOWN...", Yellow.paint(" * "));
     let mut ah = PathBuf::from(ah);
     ah.push("shutdown");
     let mut psh = ah.clone();
     psh.push("pre");
-    let files = airup_read_dir(fs::read_dir(psh).unwrap());
+    let files = airup_read_dir(fs::read_dir(psh)?);
     for i in files {
         system(&i);
     }
@@ -125,11 +125,14 @@ fn pre_shutdown(ah: &str) {
     println!("{}Calling service supervisors to stop...", Green.paint(" * "));
     let mut msh = ah.clone();
     msh.push("cleanup");
-    let files = airup_read_dir(fs::read_dir(msh).unwrap());
+    let files = airup_read_dir(fs::read_dir(msh)?);
     for i in files {
         system(&i);
     }
     println!("{}Executing cleanup services...", Green.paint(" * "));
+    println!("{}Waiting for services stop...", Green.paint(" * "));
+    sleep(time::Duration::from_millis(3000));
+    Ok(())
 }
 // Start Service Supervisor
 fn svc_running_core(id: &str) -> SvcStatus {
@@ -397,7 +400,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         timer(
             time::Duration::from_millis(kill_timeout.clone().try_into().unwrap()),
             kill_timer.clone(),
-        );
+        ).unwrap();
         regsvc(&id, SvcStatus::Stopped);
     };
     let full_restart = || {
@@ -419,7 +422,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
         timer(
             time::Duration::from_millis(kill_timeout.clone().try_into().unwrap()),
             kill_timer.clone(),
-        );
+        ).unwrap();
         regsvc(&id, SvcStatus::Restarting);
     };
     let full_exec = || {
@@ -500,7 +503,7 @@ fn svc_supervisor_main(id: &str, airup_dir: &'static str, svctoml: Value) {
                         send_signal(pid.get(), SIGKILL);
                     }
                 }
-                timer(time::Duration::from_secs(300), die_timer.clone());
+                timer(time::Duration::from_secs(300), die_timer.clone()).unwrap();
                 cleanup_now();
                 pid.set(0);
             } else if die_timer.load(Ordering::Relaxed) != 0 {
@@ -1266,10 +1269,10 @@ fn enable_rw(ah: &str) {
             } else if msg.starts_with("system ") {
                 let msg = &msg[7..];
                 if msg == "poweroff" {
-                    pre_shutdown(ah.clone());
+                    pre_shutdown(ah.clone()).unwrap();
                     power::poweroff();
                 } else if msg == "reboot" {
-                    pre_shutdown(ah.clone());
+                    pre_shutdown(ah.clone()).unwrap();
                     power::restart();
                 }
             }
