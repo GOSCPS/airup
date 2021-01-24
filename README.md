@@ -1,2 +1,1 @@
-# airup
-the airup init scheme
+Not recommend to use, needs rewrite
